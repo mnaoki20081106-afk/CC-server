@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0f1218">
+  <title>CC-Server 管理</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- Login -->
+<div id="loginView" class="login-shell">
+  <form id="loginForm" class="login-card">
+    <div class="brand-mark">C</div>
+    <h1>CC-Server 管理</h1>
+    <p>管理パネルへログイン</p>
+    <label>管理者パスワード
+      <input id="loginPassword" type="password" autocomplete="current-password" required>
+    </label>
+    <button class="btn btn-primary" type="submit" style="width:100%">ログイン</button>
+    <div id="loginError" style="color:var(--danger);font-size:13px;min-height:18px"></div>
+  </form>
+</div>
+
+<!-- App -->
+<div id="appView" class="app-shell hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark small">C</div>
+      <div><strong>CC-Server</strong><span>管理パネル</span></div>
+    </div>
+    <select id="guildSelect" class="guild-select">
+      <option value="">サーバーを選択</option>
+    </select>
+    <button class="nav-item active" data-tab="config">サーバー設定</button>
+    <button class="nav-item" data-tab="panels">パネル</button>
+    <button class="nav-item" data-tab="amazon">Amazon自販機</button>
+    <footer>
+      <button id="logoutBtn" class="ghost">ログアウト</button>
+    </footer>
+  </aside>
+
+  <main class="main">
+    <!-- サーバー設定 -->
+    <section id="tab-config" class="tab active">
+      <div class="page-head"><div><span class="eyebrow">CONFIG</span><h1>サーバー設定</h1></div></div>
+      <div id="configContent"><p class="empty">サーバーを選択してください。</p></div>
+    </section>
+
+    <!-- パネル -->
+    <section id="tab-panels" class="tab">
+      <div class="page-head"><div><span class="eyebrow">PANELS</span><h1>パネル管理</h1></div></div>
+      <div id="panelsContent"><p class="empty">サーバーを選択してください。</p></div>
+    </section>
+
+    <!-- Amazon自販機 -->
+    <section id="tab-amazon" class="tab">
+      <div class="page-head"><div><span class="eyebrow">AMAZON</span><h1>Amazon自販機</h1></div></div>
+      <div id="amazonContent"><p class="empty">サーバーを選択してください。</p></div>
+    </section>
+  </main>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
