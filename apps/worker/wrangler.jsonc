@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cc-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cc-server-db",
+      "database_id": "placeholder-set-by-bot-factory"
+    }
+  ],
+  "vars": {
+    "WEB_ORIGIN": "https://mnaoki20081106-afk.github.io",
+    "WEB_PUBLIC_URL": "https://mnaoki20081106-afk.github.io/cc-server/"
+  }
+}

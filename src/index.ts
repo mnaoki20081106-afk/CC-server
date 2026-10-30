@@ -3,7 +3,6 @@ import { config } from './config.js';
 import * as interactionCreate from './events/interactionCreate.js';
 import * as messageSecurity from './events/messageSecurity.js';
 import { guildMemberAdd, guildMemberRemove } from './events/memberEvents.js';
-import { startAdminServer } from './admin/server.js';
 
 const client = new Client({
   intents: [
@@ -18,7 +17,6 @@ const client = new Client({
 
 client.once('ready', (c) => {
   console.log(`Logged in as ${c.user.tag}`);
-  startAdminServer(c);
 });
 
 client.on('interactionCreate', interactionCreate.execute);

@@ -1,0 +1,106 @@
+{
+  "name": "cc-server",
+  "runtime": "worker",
+  "provider": "cloudflare",
+  "working_directory": "apps/worker",
+  "wrangler_config": "wrangler.jsonc",
+  "d1_schema_files": [
+    {
+      "binding": "DB",
+      "file": "schema.sql"
+    }
+  ],
+  "setup": {
+    "title": "CC-Server",
+    "description": "Discordサーバー管理BOT。管理サイト（GitHub Pages）とAmazon自販機をCloudflare Workerで運用します。初回デプロイ後にDiscord Developer PortalでInteractions Endpoint URLを設定してください。",
+    "fields": [
+      {
+        "key": "DISCORD_BOT_TOKEN",
+        "label": "BOT Token",
+        "type": "secret",
+        "required": true,
+        "source": {
+          "title": "BOT Tokenの取得方法",
+          "steps": [
+            "Discord Developer PortalでCC-Server用Applicationを開く",
+            "左メニューのBotを開く",
+            "Token欄でReset TokenまたはCopyを押して値をコピーする"
+          ],
+          "url": "https://discord.com/developers/applications",
+          "link_label": "Discord Developer Portalを開く ↗"
+        }
+      },
+      {
+        "key": "DISCORD_APPLICATION_ID",
+        "label": "Application ID",
+        "type": "text",
+        "required": true,
+        "pattern": "^\\d{17,20}$",
+        "source": {
+          "title": "Application IDの取得方法",
+          "steps": [
+            "Discord Developer PortalでCC-Server用Applicationを開く",
+            "General Informationを開く",
+            "Application IDのCopyを押す"
+          ],
+          "url": "https://discord.com/developers/applications",
+          "link_label": "Discord Developer Portalを開く ↗"
+        }
+      },
+      {
+        "key": "DISCORD_PUBLIC_KEY",
+        "label": "Public Key",
+        "type": "secret",
+        "required": true,
+        "source": {
+          "title": "Public Keyの取得方法",
+          "steps": [
+            "Discord Developer PortalでCC-Server用Applicationを開く",
+            "General Informationを開く",
+            "Public Keyをコピーする"
+          ],
+          "url": "https://discord.com/developers/applications",
+          "link_label": "Discord Developer Portalを開く ↗"
+        }
+      },
+      {
+        "key": "DASHBOARD_PASSWORD",
+        "label": "管理サイト Password",
+        "type": "secret",
+        "required": true,
+        "placeholder": "好きなパスワード",
+        "help": "GitHub Pagesの管理画面へログインするためのパスワードです。自分で分かる値を設定してください。"
+      }
+    ],
+    "discord": {
+      "intents": [
+        {
+          "id": "server-members-intent",
+          "label": "Server Members Intent",
+          "required": true,
+          "description": "入退室検知に必要です。",
+          "path": "Discord Developer Portal > Bot > Privileged Gateway Intents",
+          "url": "https://discord.com/developers/applications"
+        },
+        {
+          "id": "message-content-intent",
+          "label": "Message Content Intent",
+          "required": true,
+          "description": "Anti-Spam・危険リンク判定に必要です。",
+          "path": "Discord Developer Portal > Bot > Privileged Gateway Intents",
+          "url": "https://discord.com/developers/applications"
+        }
+      ],
+      "checks": [
+        {
+          "id": "post-deploy-interactions-url",
+          "label": "初回デプロイ後: Interactions Endpoint URLを設定",
+          "required": false,
+          "description": "Factoryの初回デプロイ完了後に発行されたWorkerのHTTPS URLを使い、Discord Developer Portal > General Information > Interactions Endpoint URLへ「https://<Worker URL>/interactions」を設定してSave Changesします。ボタン・モーダル操作を受けるために必要です。",
+          "path": "Discord Developer Portal > General Information > Interactions Endpoint URL",
+          "url": "https://discord.com/developers/applications"
+        }
+      ]
+    }
+  }
+}

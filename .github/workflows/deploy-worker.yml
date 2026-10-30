@@ -1,0 +1,32 @@
+name: Deploy CC-Server worker to Cloudflare
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "apps/worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install worker deps
+        run: npm install
+        working-directory: apps/worker
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: "3f4daf94bed8e8159413918292375b7a"
+          workingDirectory: apps/worker
+          command: deploy

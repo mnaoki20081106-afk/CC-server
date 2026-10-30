@@ -12,6 +12,4 @@ export const config = {
   devGuildId: process.env.DEV_GUILD_ID || null,
   dbPath: process.env.DB_PATH || './data/bot.sqlite',
   backupDir: process.env.BACKUP_DIR || './data/backups',
-  adminPort: process.env.ADMIN_PORT ? parseInt(process.env.ADMIN_PORT, 10) : null,
-  adminPassword: process.env.ADMIN_PASSWORD || null,
 };
