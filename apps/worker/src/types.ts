@@ -6,4 +6,5 @@ export interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
   DASHBOARD_PASSWORD: string;
+  GOOGLE_PLACES_API_KEY: string;
 }

@@ -70,6 +70,23 @@
         "required": true,
         "placeholder": "好きなパスワード",
         "help": "GitHub Pagesの管理画面へログインするためのパスワードです。自分で分かる値を設定してください。"
+      },
+      {
+        "key": "GOOGLE_PLACES_API_KEY",
+        "label": "Google Places APIキー",
+        "type": "secret",
+        "required": true,
+        "source": {
+          "title": "Google Places APIキーの取得方法",
+          "steps": [
+            "Google Cloud Consoleでプロジェクトを開く",
+            "APIとサービス > 認証情報を開く",
+            "APIキーを作成し、Places API（New）を有効にする"
+          ],
+          "url": "https://console.cloud.google.com/apis/credentials",
+          "link_label": "Google Cloud Consoleを開く ↗"
+        },
+        "help": "Amazon自販機でローソン店舗の実在確認に使用します。Google Cloud ConsoleでPlaces API（New）を有効にしたAPIキーを設定してください。"
       }
     ],
     "discord": {

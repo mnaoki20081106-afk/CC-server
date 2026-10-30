@@ -14,10 +14,30 @@ export function extractAsin(input: string): string | null {
   return null;
 }
 
-// ── Lawson validation ─────────────────────────────────────────────────────────
+// ── Lawson verification (Google Places API) ───────────────────────────────────
 
-function isLawsonAddress(addr: string): boolean {
-  return /ローソン|LAWSON/i.test(addr);
+async function verifyLawsonAddress(env: Env, address: string): Promise<{ found: boolean; storeName: string | null }> {
+  if (!env.GOOGLE_PLACES_API_KEY) throw new Error("GOOGLE_PLACES_API_KEY not configured");
+  const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": env.GOOGLE_PLACES_API_KEY,
+      "X-Goog-FieldMask": "places.displayName,places.formattedAddress",
+    },
+    body: JSON.stringify({
+      textQuery: `ローソン ${address}`,
+      languageCode: "ja",
+      maxResultCount: 3,
+      includedType: "convenience_store",
+    }),
+  });
+  if (!res.ok) throw new Error(`Places API ${res.status}`);
+  const data = await res.json() as any;
+  const places: any[] = data?.places ?? [];
+  const lawson = places.find(p => /ローソン|LAWSON/i.test(String(p?.displayName?.text ?? "")));
+  if (!lawson) return { found: false, storeName: null };
+  return { found: true, storeName: String(lawson.displayName.text) };
 }
 
 // ── Pickup number generation ──────────────────────────────────────────────────
@@ -140,14 +160,14 @@ async function createTicketChannel(
   productTitle: string,
   priceJpy: number,
   ltcAmount: number,
-  address: string,
+  storeName: string,
   inquiry: string,
   confirmation: string,
 ): Promise<void> {
   const guildCfg = await getGuildConfig(env, guildId);
 
   const allow = "68608"; // VIEW_CHANNEL(1024) | SEND_MESSAGES(2048) | READ_MESSAGE_HISTORY(65536)
-  const deny = "1024";  // VIEW_CHANNEL
+  const deny = "1024";
 
   const overwrites: any[] = [
     { id: guildId, type: 0, deny },
@@ -180,7 +200,7 @@ async function createTicketChannel(
           { name: "商品", value: productTitle.slice(0, 1024), inline: false },
           { name: "Amazon価格", value: `¥${priceJpy.toLocaleString("ja-JP")}`, inline: true },
           { name: "請求額（LTC）", value: `${ltcAmount} LTC`, inline: true },
-          { name: "お届け先", value: address.slice(0, 1024), inline: false },
+          { name: "お受け取り店舗", value: storeName, inline: false },
           { name: "📦 お問い合わせ番号", value: `\`${inquiry}\``, inline: true },
           { name: "🔑 確認番号", value: `\`${confirmation}\``, inline: true },
         ],
@@ -190,14 +210,36 @@ async function createTicketChannel(
   });
 }
 
+// ── Address modal (shared) ────────────────────────────────────────────────────
+
+function addressModalData(customId: string): unknown {
+  return {
+    custom_id: customId,
+    title: "お届け先を入力（ローソン）",
+    components: [{
+      type: 1,
+      components: [{
+        type: 4,
+        custom_id: "address",
+        style: 2,
+        label: "ローソンの店舗名・住所",
+        placeholder: "例：ローソン 渋谷道玄坂店\n東京都渋谷区道玄坂2-25-12",
+        required: true,
+        min_length: 5,
+        max_length: 300,
+      }],
+    }],
+  };
+}
+
 // ── Interaction helpers ───────────────────────────────────────────────────────
 
 function interactionResponse(data: unknown): Response {
   return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 }
 
-function ephemeral(content: string, components?: unknown[]): unknown {
-  return { type: 4, data: { content, flags: 64, ...(components ? { components } : {}) } };
+function ephemeral(content: string): unknown {
+  return { type: 4, data: { content, flags: 64 } };
 }
 
 function deferEphemeral(): Response {
@@ -217,35 +259,20 @@ export async function handleAvBuyButton(interaction: any, env: Env): Promise<Res
     type: 9,
     data: {
       custom_id: `av:url_modal:${guildId}`,
-      title: "Amazon自販機",
-      components: [
-        {
-          type: 1,
-          components: [{
-            type: 4,
-            custom_id: "url",
-            style: 1,
-            label: "AmazonのURLまたはASIN",
-            placeholder: "https://www.amazon.co.jp/dp/XXXXXXXXXX または XXXXXXXXXX",
-            required: true,
-            min_length: 10,
-            max_length: 200,
-          }],
-        },
-        {
-          type: 1,
-          components: [{
-            type: 4,
-            custom_id: "address",
-            style: 2,
-            label: "お届け先（ローソン店舗名・住所）",
-            placeholder: "例：ローソン 渋谷道玄坂店\n東京都渋谷区道玄坂2-25-12",
-            required: true,
-            min_length: 5,
-            max_length: 300,
-          }],
-        },
-      ],
+      title: "Amazon商品URLを入力",
+      components: [{
+        type: 1,
+        components: [{
+          type: 4,
+          custom_id: "url",
+          style: 1,
+          label: "AmazonのURLまたはASIN",
+          placeholder: "https://www.amazon.co.jp/dp/XXXXXXXXXX または XXXXXXXXXX",
+          required: true,
+          min_length: 10,
+          max_length: 200,
+        }],
+      }],
     },
   });
 }
@@ -253,22 +280,10 @@ export async function handleAvBuyButton(interaction: any, env: Env): Promise<Res
 export async function handleAvUrlModal(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const guildId = String(interaction.guild_id ?? "");
   const userId = String(interaction.member?.user?.id ?? "");
-  const username = String(interaction.member?.user?.username ?? "user");
-
-  const components = interaction.data?.components as Array<{ components: Array<{ custom_id: string; value: string }> }> ?? [];
-  const rawUrl = components.find(r => r.components[0]?.custom_id === "url")?.components[0]?.value?.trim() ?? "";
-  const address = components.find(r => r.components[0]?.custom_id === "address")?.components[0]?.value?.trim() ?? "";
-
+  const rawUrl = String(interaction.data?.components?.[0]?.components?.[0]?.value ?? "").trim();
   const asin = extractAsin(rawUrl);
   if (!asin) {
     return interactionResponse(ephemeral("AmazonのURLまたはASINが正しくありません。"));
-  }
-
-  // Validate Lawson before deferring — synchronous, no API needed
-  if (!isLawsonAddress(address)) {
-    return interactionResponse(ephemeral(
-      "⚠️ お届け先はローソン店舗のみ対応しています。\nローソンの店舗名と住所を入力してください。\n\n例：`ローソン 渋谷道玄坂店 東京都渋谷区道玄坂2-25-12`"
-    ));
   }
 
   await ensureSchema(env);
@@ -295,7 +310,7 @@ export async function handleAvUrlModal(interaction: any, env: Env, ctx: Executio
         guild_id: guildId,
         user_id: userId,
         asin,
-        product_json: JSON.stringify({ ...product, address }),
+        product_json: JSON.stringify(product),
         created_at: Date.now(),
       });
 
@@ -306,8 +321,14 @@ export async function handleAvUrlModal(interaction: any, env: Env, ctx: Executio
           description: `¥${v.priceJpy.toLocaleString("ja-JP")}`,
         }));
         await patchInteraction(appId, token, {
-          content: `**${product.title.slice(0, 200)}**\n\nバリエーションを選択してください:`,
+          content: "",
           flags: 64,
+          embeds: [{
+            title: product.title.slice(0, 256),
+            description: "バリエーションを選択してください。",
+            color: 0xff9900,
+            ...(product.imageUrl ? { thumbnail: { url: product.imageUrl } } : {}),
+          }],
           components: [{
             type: 1,
             components: [{
@@ -321,13 +342,29 @@ export async function handleAvUrlModal(interaction: any, env: Env, ctx: Executio
           }],
         });
       } else {
-        const ltcAmount = await calcLtcAmount(product.mainPriceJpy);
-        const { inquiry, confirmation } = genPickupNumbers();
-        await Promise.all([
-          patchInteraction(appId, token, buildPaymentMessage(product.title, product.mainPriceJpy, ltcAmount, cfg.ltc_address!, product.imageUrl)),
-          createTicketChannel(env, guildId, userId, username, product.title, product.mainPriceJpy, ltcAmount, address, inquiry, confirmation),
-        ]);
-        await deleteAvSession(env, sessionId);
+        // No variants — show product info with "住所を入力" button
+        await patchInteraction(appId, token, {
+          content: "",
+          flags: 64,
+          embeds: [{
+            title: product.title.slice(0, 256),
+            color: 0xff9900,
+            fields: [
+              { name: "Amazon価格", value: `¥${product.mainPriceJpy.toLocaleString("ja-JP")}`, inline: true },
+            ],
+            ...(product.imageUrl ? { thumbnail: { url: product.imageUrl } } : {}),
+          }],
+          components: [{
+            type: 1,
+            components: [{
+              type: 2,
+              custom_id: `av:next:${sessionId}`,
+              label: "お届け先を入力",
+              style: 1,
+              emoji: { name: "📦" },
+            }],
+          }],
+        });
       }
     } catch (err) {
       console.error("av:url_modal deferred error", err);
@@ -338,65 +375,132 @@ export async function handleAvUrlModal(interaction: any, env: Env, ctx: Executio
   return deferredRes;
 }
 
-export async function handleAvSelect(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+// Called when user clicks "お届け先を入力" button after no-variant product fetch
+export function handleAvNext(interaction: any): Response {
+  const sessionId = String(interaction.data?.custom_id ?? "").split(":")[2] ?? "";
+  return interactionResponse({
+    type: 9,
+    data: addressModalData(`av:addr_modal:${sessionId}`),
+  });
+}
+
+// Called when user selects a variant — returns address modal directly
+export async function handleAvSelect(interaction: any, env: Env): Promise<Response> {
   const value = String(interaction.data?.values?.[0] ?? "");
   const parts = value.split(":");
   if (parts.length < 3) return interactionResponse(ephemeral("選択値が不正です。"));
   const [sessionId, variantAsin, priceStr] = parts as [string, string, string];
-  const priceJpy = Number(priceStr);
-  if (!priceJpy) return interactionResponse(ephemeral("価格情報が不正です。"));
+  if (!Number(priceStr)) return interactionResponse(ephemeral("価格情報が不正です。"));
 
-  await ensureSchema(env);
-  const session = await getAvSession(env, sessionId);
-  const guildId = String(interaction.guild_id ?? "");
-  const userId = String(interaction.member?.user?.id ?? "");
-  const username = String(interaction.member?.user?.username ?? "user");
-  const cfg = await getAvConfig(env, guildId);
-
-  let title = `ASIN: ${variantAsin}`;
-  let address = "";
-  let imageUrl: string | null = null;
-  if (session) {
-    try {
-      const product = JSON.parse(session.product_json) as any;
-      const variant = (product.variants ?? []).find((v: any) => v.asin === variantAsin);
-      if (variant?.title) title = variant.title;
-      address = String(product.address ?? "");
-      imageUrl = product.imageUrl ?? null;
-    } catch { /* ignore */ }
-    await deleteAvSession(env, sessionId);
-  }
-
-  const ltcAmount = await calcLtcAmount(priceJpy);
-  const { inquiry, confirmation } = genPickupNumbers();
-
-  ctx.waitUntil(
-    createTicketChannel(env, guildId, userId, username, title, priceJpy, ltcAmount, address, inquiry, confirmation)
-      .catch(err => console.error("av ticket channel error", err))
-  );
-
+  // Session stays alive until address modal completes
   return interactionResponse({
-    type: 7,
-    data: buildPaymentMessage(title, priceJpy, ltcAmount, cfg.ltc_address ?? "", imageUrl),
+    type: 9,
+    data: addressModalData(`av:addr_modal:${sessionId}:${variantAsin}:${priceStr}`),
   });
 }
 
-function buildPaymentMessage(title: string, priceJpy: number, ltcAmount: number, ltcAddress: string, imageUrl: string | null): unknown {
+// Final step: address modal submit — verify Lawson, create ticket channel, return payment embed
+export async function handleAvAddrModal(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const customId = String(interaction.data?.custom_id ?? "");
+  const parts = customId.split(":");
+  const sessionId = parts[2] ?? "";
+  const variantAsin = parts[3] ?? null;
+  const variantPriceJpy = parts[4] ? Number(parts[4]) : null;
+
+  const address = String(
+    (interaction.data?.components as any[] | undefined)?.[0]?.components?.[0]?.value ?? ""
+  ).trim();
+
+  await ensureSchema(env);
+  const session = await getAvSession(env, sessionId);
+  if (!session) return interactionResponse(ephemeral("セッションが切れました。もう一度最初からお試しください。"));
+
+  const guildId = String(interaction.guild_id ?? "");
+  const userId = String(interaction.member?.user?.id ?? "");
+  const username = String(interaction.member?.user?.username ?? "user");
+
+  // Verify Lawson store via Google Places, fallback to regex if API unavailable
+  let storeName: string | null = null;
+  try {
+    const result = await verifyLawsonAddress(env, address);
+    if (!result.found) {
+      return interactionResponse(ephemeral(
+        "⚠️ このローソン店舗を見つけられませんでした。\n店舗名と住所を正確に入力してください。\n\n例：`ローソン 渋谷道玄坂店 東京都渋谷区道玄坂2-25-12`"
+      ));
+    }
+    storeName = result.storeName;
+  } catch (err) {
+    console.error("Places API error, falling back to regex", err);
+    const m = address.match(/ローソン[぀-ゟ゠-ヿ一-鿿\w\s　（）()A-Za-z0-9０-９]*?店/);
+    if (!m) {
+      return interactionResponse(ephemeral(
+        "⚠️ お届け先はローソン店舗のみ対応しています。\nローソンの店舗名と住所を入力してください。"
+      ));
+    }
+    storeName = m[0].trim();
+  }
+
+  // Resolve product title and price from session
+  let title: string;
+  let priceJpy: number;
+  let imageUrl: string | null = null;
+  try {
+    const product = JSON.parse(session.product_json) as any;
+    imageUrl = product.imageUrl ?? null;
+    if (variantAsin && variantPriceJpy) {
+      const variant = (product.variants ?? []).find((v: any) => v.asin === variantAsin);
+      title = String(variant?.title || `ASIN: ${variantAsin}`);
+      priceJpy = variantPriceJpy;
+    } else {
+      title = String(product.title ?? session.asin);
+      priceJpy = Number(product.mainPriceJpy ?? 0);
+    }
+  } catch {
+    return interactionResponse(ephemeral("商品情報の読み込みに失敗しました。"));
+  }
+
+  const cfg = await getAvConfig(env, guildId);
+  const ltcAmount = await calcLtcAmount(priceJpy);
+  const { inquiry, confirmation } = genPickupNumbers();
+  const finalStoreName = storeName ?? address;
+
+  ctx.waitUntil(
+    Promise.all([
+      createTicketChannel(env, guildId, userId, username, title, priceJpy, ltcAmount, finalStoreName, inquiry, confirmation),
+      deleteAvSession(env, sessionId),
+    ]).catch(err => console.error("av ticket channel error", err))
+  );
+
+  return interactionResponse({
+    type: 4,
+    data: buildPaymentMessage(title, priceJpy, ltcAmount, cfg.ltc_address ?? "", imageUrl, finalStoreName),
+  });
+}
+
+function buildPaymentMessage(
+  title: string,
+  priceJpy: number,
+  ltcAmount: number,
+  ltcAddress: string,
+  imageUrl: string | null,
+  storeName: string,
+): unknown {
   return {
     content: "",
     flags: 64,
     components: [],
     embeds: [{
       title: "お支払い情報",
-      description: `**${title.slice(0, 200)}**\n\nAmazon価格の1/3をLTCでお支払いください。\nチャンネルにてお問い合わせ番号をお送りしました。`,
+      description: `**${title.slice(0, 200)}**\n\nAmazon価格の1/3をLTCでお支払いください。`,
       color: 0xbfb78f,
       fields: [
         { name: "Amazon価格", value: `¥${priceJpy.toLocaleString("ja-JP")}`, inline: true },
         { name: "請求額 (1/3)", value: `${ltcAmount} LTC`, inline: true },
+        { name: "お受け取り店舗", value: storeName, inline: false },
         { name: "送金先LTCアドレス", value: `\`${ltcAddress}\`` },
       ],
       ...(imageUrl ? { thumbnail: { url: imageUrl } } : {}),
-      footer: { text: "送金後、スタッフが確認次第チャンネルにてご連絡します" },
+      footer: { text: "送金後、スタッフがチャンネルにてご連絡します" },
     }],
   };
 }

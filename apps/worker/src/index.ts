@@ -7,7 +7,7 @@ import {
 } from "./db";
 import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
 import { sha256Hex, randomToken, corsHeaders, json } from "./utils";
-import { handleAvBuyButton, handleAvUrlModal, handleAvSelect } from "./amazon-vending";
+import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal } from "./amazon-vending";
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -56,7 +56,17 @@ async function processInteraction(interaction: any, env: Env, ctx: ExecutionCont
 
   // Amazon自販機 select: av:select:<sessionId>
   if (type === 3 && customId.startsWith("av:select:")) {
-    return handleAvSelect(interaction, env, ctx);
+    return handleAvSelect(interaction, env);
+  }
+
+  // Amazon自販機 next button: av:next:<sessionId>
+  if (type === 3 && customId.startsWith("av:next:")) {
+    return handleAvNext(interaction);
+  }
+
+  // Amazon自販機 address modal: av:addr_modal:<sessionId>[:<variantAsin>:<priceJpy>]
+  if (type === 5 && customId.startsWith("av:addr_modal:")) {
+    return handleAvAddrModal(interaction, env, ctx);
   }
 
   // Panel button: panel:<buttonId>
