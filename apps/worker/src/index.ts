@@ -56,7 +56,7 @@ async function processInteraction(interaction: any, env: Env, ctx: ExecutionCont
 
   // Amazon自販機 select: av:select:<sessionId>
   if (type === 3 && customId.startsWith("av:select:")) {
-    return handleAvSelect(interaction, env);
+    return handleAvSelect(interaction, env, ctx);
   }
 
   // Panel button: panel:<buttonId>
