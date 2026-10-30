@@ -17,6 +17,11 @@ import { db, getGuildConfig } from '../db.js';
 import { closeTicket } from '../commands/ticket.js';
 import { restoreBackup, backupFilePath } from '../commands/backup.js';
 import { readFileSync } from 'node:fs';
+import {
+  handleAmazonVendingButton,
+  handleAmazonVendingModal,
+  handleAmazonVendingSelect,
+} from '../handlers/amazon-vending-interactions.js';
 
 const VERIFY_TTL_MS = 5 * 60 * 1000;
 
@@ -37,7 +42,13 @@ export async function execute(interaction: Interaction) {
     return;
   }
 
+  if (interaction.isStringSelectMenu()) {
+    if (await handleAmazonVendingSelect(interaction)) return;
+    return;
+  }
+
   if (interaction.isButton()) {
+    if (await handleAmazonVendingButton(interaction)) return;
     const [namespace, action, extra] = interaction.customId.split(':');
 
     if (namespace === 'verify' && action === 'start') {
@@ -160,6 +171,8 @@ export async function execute(interaction: Interaction) {
 
     return;
   }
+
+  if (await handleAmazonVendingModal(interaction)) return;
 
   if (interaction.isModalSubmit() && interaction.customId === 'verify:modal') {
     const pending = db

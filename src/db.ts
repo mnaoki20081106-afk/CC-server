@@ -120,6 +120,24 @@ CREATE TABLE IF NOT EXISTS shop_purchases (
   purchased_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS amazon_vending_config (
+  guild_id TEXT PRIMARY KEY,
+  panel_title TEXT NOT NULL DEFAULT 'Amazon自販機',
+  panel_description TEXT DEFAULT 'Amazon商品をLTCで購入できます。',
+  ltc_address TEXT,
+  api_type TEXT NOT NULL DEFAULT 'rainforest',
+  api_key TEXT
+);
+
+CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  asin TEXT NOT NULL,
+  product_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS security_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id TEXT NOT NULL,

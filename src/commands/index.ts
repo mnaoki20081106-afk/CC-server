@@ -9,5 +9,6 @@ import panel from './panel.js';
 import economy from './economy.js';
 import shop from './shop.js';
 import backup from './backup.js';
+import amazonVending from './amazon-vending.js';
 
-export const commands: Command[] = [setup, servermanage, security, verify, welcome, ticket, panel, economy, shop, backup];
+export const commands: Command[] = [setup, servermanage, security, verify, welcome, ticket, panel, economy, shop, backup, amazonVending];
