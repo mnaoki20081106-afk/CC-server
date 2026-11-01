@@ -1,4 +1,5 @@
 import type { Env } from "./types";
+import { SECURITY_SCHEMA_STATEMENTS } from "./security/db";
 
 let schemaReady = false;
 
@@ -83,6 +84,8 @@ const SCHEMA_STATEMENTS = [
     icon TEXT,
     seen_at INTEGER NOT NULL
   )`,
+
+  ...SECURITY_SCHEMA_STATEMENTS,
 ];
 
 export async function ensureSchema(env: Env): Promise<void> {
