@@ -1,42 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, clearSession, currentSession, login } from "./api";
+import ServerEditor, { type ServerConfig } from "./ServerEditor";
+import SecurityManager, { type SecurityConfig } from "./SecurityManager";
+import Panels, { type Panel, type PanelButton } from "./Panels";
+import AmazonVending, { type AvConfig } from "./AmazonVending";
 
 type Guild = { id: string; name: string; icon: string | null };
 type Channel = { id: string; name: string; type: number; parent_id: string | null };
 type Role = { id: string; name: string; color: number };
 type Meta = { id: string; name: string; icon: string | null; channels: Channel[]; roles: Role[] };
 
-type GuildConfig = {
-  admin_role_id: string | null;
-  mod_role_id: string | null;
-  log_channel_id: string | null;
-  verified_role_id: string | null;
-  verify_channel_id: string | null;
-  welcome_channel_id: string | null;
-  welcome_message: string | null;
-  leave_channel_id: string | null;
-  leave_message: string | null;
-  anti_spam_enabled: number;
-  anti_spam_threshold: number;
-  anti_spam_window_ms: number;
-  anti_link_enabled: number;
-  anti_link_whitelist: string;
-  raid_protection_enabled: number;
-  raid_join_threshold: number;
-  raid_window_ms: number;
-  raid_action: string;
-};
-
-type Panel = { id: number; title: string; description: string | null; message_id: string | null; channel_id: string | null };
-type PanelButton = { id: number; label: string; style: string; emoji: string | null; action_type: string; action_value: string };
-
-type AvConfig = {
-  panel_title: string;
-  panel_description: string | null;
-  ltc_address: string | null;
-  api_type: string;
-  api_key: string | null;
-};
+type GuildConfig = ServerConfig & SecurityConfig;
 
 type ServiceStatus = {
   discordReady: boolean;
@@ -46,7 +20,7 @@ type ServiceStatus = {
   inviteUrl: string;
 };
 
-const STYLE_LABEL: Record<string, string> = { Primary: "青", Secondary: "グレー", Success: "緑", Danger: "赤" };
+type ActiveTab = "server" | "security" | "panels" | "amazon";
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState(() => Boolean(currentSession()));
@@ -60,7 +34,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [config, setConfig] = useState<GuildConfig | null>(null);
-  const [activeTab, setActiveTab] = useState<"config" | "panels" | "amazon">("config");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("server");
 
   const [panels, setPanels] = useState<Panel[]>([]);
   const [panelButtons, setPanelButtons] = useState<Record<number, PanelButton[]>>({});
@@ -104,14 +78,11 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const [m, c] = await Promise.all([
-        api<Meta>(`/api/guilds/${guildId}/meta`),
-        api<GuildConfig>(`/api/guilds/${guildId}/config`)
-      ]);
+      const [m, c] = await Promise.all([api<Meta>(`/api/guilds/${guildId}/meta`), api<GuildConfig>(`/api/guilds/${guildId}/config`)]);
       setMeta(m);
       setConfig(c);
       setSelectedId(guildId);
-      setActiveTab("config");
+      setActiveTab("server");
     } catch (reason) {
       fail(reason);
     } finally {
@@ -119,13 +90,13 @@ export default function App() {
     }
   }
 
-  async function saveConfig(patch: Partial<GuildConfig>) {
+  async function saveConfig(patch: Partial<GuildConfig>, successMessage: string) {
     if (!selectedId) return;
     setBusy(true);
     try {
       await api(`/api/guilds/${selectedId}/config`, { method: "PUT", body: JSON.stringify(patch) });
       setConfig(prev => (prev ? { ...prev, ...patch } : prev));
-      flash("保存しました");
+      flash(successMessage);
     } catch (reason) {
       fail(reason);
     } finally {
@@ -139,9 +110,7 @@ export default function App() {
     try {
       const list = await api<Panel[]>(`/api/guilds/${selectedId}/panels`);
       setPanels(list);
-      const entries = await Promise.all(
-        list.map(async p => [p.id, await api<PanelButton[]>(`/api/guilds/${selectedId}/panels/${p.id}/buttons`)] as const)
-      );
+      const entries = await Promise.all(list.map(async p => [p.id, await api<PanelButton[]>(`/api/guilds/${selectedId}/panels/${p.id}/buttons`)] as const));
       setPanelButtons(Object.fromEntries(entries));
     } catch (reason) {
       fail(reason);
@@ -153,10 +122,7 @@ export default function App() {
   async function createPanel(title: string, description: string) {
     if (!selectedId || !title.trim()) return;
     try {
-      await api(`/api/guilds/${selectedId}/panels`, {
-        method: "POST",
-        body: JSON.stringify({ title: title.trim(), description: description.trim() || null })
-      });
+      await api(`/api/guilds/${selectedId}/panels`, { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim() || null }) });
       await loadPanels();
       flash("パネルを作成しました");
     } catch (reason) {
@@ -305,11 +271,7 @@ export default function App() {
             </p>
           )}
           {guilds.map(guild => (
-            <button
-              key={guild.id}
-              className={`server-button ${selectedId === guild.id ? "active" : ""}`}
-              onClick={() => void selectGuild(guild.id)}
-            >
+            <button key={guild.id} className={`server-button ${selectedId === guild.id ? "active" : ""}`} onClick={() => void selectGuild(guild.id)}>
               {guild.icon ? (
                 <img src={`https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=80`} alt="" />
               ) : (
@@ -380,8 +342,11 @@ export default function App() {
         {selectedGuild && meta && config && (
           <>
             <nav className="page-tabs" role="tablist" aria-label="管理機能">
-              <button type="button" role="tab" aria-selected={activeTab === "config"} className={activeTab === "config" ? "active" : ""} onClick={() => setActiveTab("config")}>
+              <button type="button" role="tab" aria-selected={activeTab === "server"} className={activeTab === "server" ? "active" : ""} onClick={() => setActiveTab("server")}>
                 サーバー設定
+              </button>
+              <button type="button" role="tab" aria-selected={activeTab === "security"} className={activeTab === "security" ? "active" : ""} onClick={() => setActiveTab("security")}>
+                セキュリティ
               </button>
               <button type="button" role="tab" aria-selected={activeTab === "panels"} className={activeTab === "panels" ? "active" : ""} onClick={() => setActiveTab("panels")}>
                 パネル
@@ -391,9 +356,12 @@ export default function App() {
               </button>
             </nav>
 
-            {activeTab === "config" && <ConfigTab meta={meta} config={config} onSave={saveConfig} />}
+            {activeTab === "server" && <ServerEditor meta={meta} config={config} onSave={patch => void saveConfig(patch, "サーバー設定を保存しました")} />}
+            {activeTab === "security" && (
+              <SecurityManager channels={meta.channels} config={config} onSave={patch => void saveConfig(patch, "セキュリティ設定を保存しました")} />
+            )}
             {activeTab === "panels" && (
-              <PanelsTab
+              <Panels
                 meta={meta}
                 panels={panels}
                 panelButtons={panelButtons}
@@ -403,346 +371,10 @@ export default function App() {
                 onPostPanel={postPanel}
               />
             )}
-            {activeTab === "amazon" && avConfig && <AmazonTab meta={meta} avConfig={avConfig} onSave={saveAvConfig} onPost={postAvPanel} />}
+            {activeTab === "amazon" && avConfig && <AmazonVending meta={meta} avConfig={avConfig} onSave={saveAvConfig} onPost={postAvPanel} />}
           </>
         )}
       </main>
     </div>
-  );
-}
-
-function ConfigTab({ meta, config, onSave }: { meta: Meta; config: GuildConfig; onSave: (patch: Partial<GuildConfig>) => void }) {
-  const [draft, setDraft] = useState(config);
-  useEffect(() => setDraft(config), [config]);
-
-  function Role({ k, label }: { k: keyof GuildConfig; label: string }) {
-    return (
-      <label className="field">
-        <span>{label}</span>
-        <select value={(draft[k] as string) ?? ""} onChange={e => setDraft({ ...draft, [k]: e.target.value || null })}>
-          <option value="">なし</option>
-          {meta.roles.map(r => (
-            <option key={r.id} value={r.id}>
-              {r.name}
-            </option>
-          ))}
-        </select>
-      </label>
-    );
-  }
-
-  function Chan({ k, label }: { k: keyof GuildConfig; label: string }) {
-    return (
-      <label className="field">
-        <span>{label}</span>
-        <select value={(draft[k] as string) ?? ""} onChange={e => setDraft({ ...draft, [k]: e.target.value || null })}>
-          <option value="">なし</option>
-          {meta.channels.map(c => (
-            <option key={c.id} value={c.id}>
-              #{c.name}
-            </option>
-          ))}
-        </select>
-      </label>
-    );
-  }
-
-  return (
-    <section className="card" style={{ padding: 24 }}>
-      <div className="section-head">
-        <h2>サーバー設定</h2>
-        <button className="primary" onClick={() => onSave(draft)}>
-          保存
-        </button>
-      </div>
-      <div className="form-grid two">
-        <Role k="admin_role_id" label="管理者ロール" />
-        <Role k="mod_role_id" label="モデレーターロール" />
-        <Chan k="log_channel_id" label="ログチャンネル" />
-        <Role k="verified_role_id" label="認証済みロール" />
-        <Chan k="verify_channel_id" label="認証チャンネル" />
-        <Chan k="welcome_channel_id" label="入室メッセージ送信先" />
-        <label className="field" style={{ gridColumn: "1 / -1" }}>
-          <span>入室メッセージ（{"{user}"} でメンション）</span>
-          <input value={draft.welcome_message ?? ""} onChange={e => setDraft({ ...draft, welcome_message: e.target.value })} />
-        </label>
-        <Chan k="leave_channel_id" label="退室メッセージ送信先" />
-        <label className="field" style={{ gridColumn: "1 / -1" }}>
-          <span>退室メッセージ（{"{user}"} でメンション）</span>
-          <input value={draft.leave_message ?? ""} onChange={e => setDraft({ ...draft, leave_message: e.target.value })} />
-        </label>
-      </div>
-
-      <div className="toggle-stack">
-        <div className="toggle-row">
-          <div className="toggle-copy">
-            <strong>Anti-Spam</strong>
-            <small>短時間の連投を検知します</small>
-          </div>
-          <label className={`switch ${draft.anti_spam_enabled ? "on" : ""}`}>
-            <input type="checkbox" checked={Boolean(draft.anti_spam_enabled)} onChange={e => setDraft({ ...draft, anti_spam_enabled: e.target.checked ? 1 : 0 })} />
-            <span />
-          </label>
-        </div>
-        <div className="toggle-row">
-          <div className="toggle-copy">
-            <strong>Anti-Link</strong>
-            <small>不審なリンクの投稿を検知します</small>
-          </div>
-          <label className={`switch ${draft.anti_link_enabled ? "on" : ""}`}>
-            <input type="checkbox" checked={Boolean(draft.anti_link_enabled)} onChange={e => setDraft({ ...draft, anti_link_enabled: e.target.checked ? 1 : 0 })} />
-            <span />
-          </label>
-        </div>
-        <div className="toggle-row">
-          <div className="toggle-copy">
-            <strong>Raid Protection</strong>
-            <small>短時間の大量参加を検知します</small>
-          </div>
-          <label className={`switch ${draft.raid_protection_enabled ? "on" : ""}`}>
-            <input
-              type="checkbox"
-              checked={Boolean(draft.raid_protection_enabled)}
-              onChange={e => setDraft({ ...draft, raid_protection_enabled: e.target.checked ? 1 : 0 })}
-            />
-            <span />
-          </label>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function PanelsTab({
-  meta,
-  panels,
-  panelButtons,
-  onCreatePanel,
-  onAddButton,
-  onDeleteButton,
-  onPostPanel
-}: {
-  meta: Meta;
-  panels: Panel[];
-  panelButtons: Record<number, PanelButton[]>;
-  onCreatePanel: (title: string, description: string) => void;
-  onAddButton: (panelId: number, data: { label: string; style: string; action_type: string; action_value: string }) => void;
-  onDeleteButton: (panelId: number, buttonId: number) => void;
-  onPostPanel: (panelId: number, channelId: string) => void;
-}) {
-  const [title, setTitle] = useState("");
-  const [desc, setDesc] = useState("");
-
-  return (
-    <section className="stack">
-      <div className="card" style={{ padding: 24 }}>
-        <h2>新規パネル作成</h2>
-        <div className="form-grid two">
-          <label className="field">
-            <span>タイトル</span>
-            <input value={title} onChange={e => setTitle(e.target.value)} />
-          </label>
-          <label className="field">
-            <span>説明文（任意）</span>
-            <input value={desc} onChange={e => setDesc(e.target.value)} />
-          </label>
-        </div>
-        <div className="button-row">
-          <button
-            className="primary"
-            onClick={() => {
-              onCreatePanel(title, desc);
-              setTitle("");
-              setDesc("");
-            }}
-          >
-            作成
-          </button>
-        </div>
-      </div>
-
-      {panels.map(p => (
-        <PanelCard key={p.id} panel={p} meta={meta} buttons={panelButtons[p.id] ?? []} onAddButton={onAddButton} onDeleteButton={onDeleteButton} onPost={onPostPanel} />
-      ))}
-    </section>
-  );
-}
-
-function PanelCard({
-  panel,
-  meta,
-  buttons,
-  onAddButton,
-  onDeleteButton,
-  onPost
-}: {
-  panel: Panel;
-  meta: Meta;
-  buttons: PanelButton[];
-  onAddButton: (panelId: number, data: { label: string; style: string; action_type: string; action_value: string }) => void;
-  onDeleteButton: (panelId: number, buttonId: number) => void;
-  onPost: (panelId: number, channelId: string) => void;
-}) {
-  const [label, setLabel] = useState("");
-  const [style, setStyle] = useState("Primary");
-  const [actionType, setActionType] = useState("toggle_role");
-  const [actionValue, setActionValue] = useState("");
-  const [channelId, setChannelId] = useState("");
-
-  return (
-    <div className="card" style={{ padding: 24 }}>
-      <div className="section-head">
-        <h2>{panel.title}</h2>
-      </div>
-      {panel.description && <p className="muted">{panel.description}</p>}
-
-      <div className="button-row" style={{ flexWrap: "wrap" }}>
-        {buttons.map(b => (
-          <span key={b.id} className="status-pill">
-            {b.label} ({STYLE_LABEL[b.style] ?? b.style})
-            <button className="icon-button" onClick={() => onDeleteButton(panel.id, b.id)} title="削除">
-              ×
-            </button>
-          </span>
-        ))}
-      </div>
-
-      <div className="form-grid three" style={{ marginTop: 16 }}>
-        <label className="field">
-          <span>ラベル</span>
-          <input value={label} onChange={e => setLabel(e.target.value)} />
-        </label>
-        <label className="field">
-          <span>色</span>
-          <select value={style} onChange={e => setStyle(e.target.value)}>
-            {Object.entries(STYLE_LABEL).map(([k, v]) => (
-              <option key={k} value={k}>
-                {v}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field">
-          <span>アクション</span>
-          <select value={actionType} onChange={e => setActionType(e.target.value)}>
-            <option value="toggle_role">ロール付与/剥奪</option>
-            <option value="show_text">テキスト表示</option>
-          </select>
-        </label>
-        <label className="field" style={{ gridColumn: "1 / -1" }}>
-          <span>ロールID or テキスト</span>
-          <input value={actionValue} onChange={e => setActionValue(e.target.value)} />
-        </label>
-      </div>
-      <div className="button-row">
-        <button
-          className="secondary"
-          onClick={() => {
-            if (!label.trim() || !actionValue.trim()) return;
-            onAddButton(panel.id, { label: label.trim(), style, action_type: actionType, action_value: actionValue.trim() });
-            setLabel("");
-            setActionValue("");
-          }}
-        >
-          ボタン追加
-        </button>
-      </div>
-
-      <div className="form-grid two" style={{ marginTop: 16 }}>
-        <label className="field">
-          <span>投稿先チャンネル</span>
-          <select value={channelId} onChange={e => setChannelId(e.target.value)}>
-            <option value="">チャンネルを選択</option>
-            {meta.channels.map(c => (
-              <option key={c.id} value={c.id}>
-                #{c.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="button-row">
-        <button className="primary" onClick={() => onPost(panel.id, channelId)} disabled={!channelId}>
-          投稿
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function AmazonTab({
-  meta,
-  avConfig,
-  onSave,
-  onPost
-}: {
-  meta: Meta;
-  avConfig: AvConfig;
-  onSave: (cfg: AvConfig) => void;
-  onPost: (channelId: string) => void;
-}) {
-  const [draft, setDraft] = useState(avConfig);
-  const [channelId, setChannelId] = useState("");
-  useEffect(() => setDraft(avConfig), [avConfig]);
-
-  return (
-    <section className="stack">
-      <div className="card" style={{ padding: 24 }}>
-        <div className="section-head">
-          <h2>Amazon自販機 設定</h2>
-          <button className="primary" onClick={() => onSave(draft)}>
-            設定保存
-          </button>
-        </div>
-        <div className="form-grid two">
-          <label className="field" style={{ gridColumn: "1 / -1" }}>
-            <span>パネルタイトル</span>
-            <input maxLength={100} value={draft.panel_title} onChange={e => setDraft({ ...draft, panel_title: e.target.value })} />
-          </label>
-          <label className="field" style={{ gridColumn: "1 / -1" }}>
-            <span>パネル説明文</span>
-            <textarea maxLength={500} value={draft.panel_description ?? ""} onChange={e => setDraft({ ...draft, panel_description: e.target.value })} />
-          </label>
-          <label className="field" style={{ gridColumn: "1 / -1" }}>
-            <span>LTCアドレス</span>
-            <input placeholder="Lxxxxxxxxxx..." value={draft.ltc_address ?? ""} onChange={e => setDraft({ ...draft, ltc_address: e.target.value })} />
-          </label>
-          <label className="field">
-            <span>API種別</span>
-            <select value={draft.api_type} onChange={e => setDraft({ ...draft, api_type: e.target.value })}>
-              <option value="rainforest">Rainforest API</option>
-              <option value="keepa">Keepa API</option>
-              <option value="canopy">Canopy API</option>
-            </select>
-          </label>
-          <label className="field">
-            <span>APIキー</span>
-            <input type="password" value={draft.api_key ?? ""} onChange={e => setDraft({ ...draft, api_key: e.target.value })} />
-          </label>
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <h2>パネルを設置</h2>
-        <div className="form-grid two">
-          <label className="field">
-            <span>投稿先チャンネル</span>
-            <select value={channelId} onChange={e => setChannelId(e.target.value)}>
-              <option value="">チャンネルを選択</option>
-              {meta.channels.map(c => (
-                <option key={c.id} value={c.id}>
-                  #{c.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="button-row">
-          <button className="primary" onClick={() => onPost(channelId)} disabled={!channelId}>
-            投稿
-          </button>
-        </div>
-      </div>
-    </section>
   );
 }

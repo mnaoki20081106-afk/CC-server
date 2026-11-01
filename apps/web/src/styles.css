@@ -266,6 +266,7 @@ code {
   font-weight: 800;
   letter-spacing: .04em;
 }
+.field small { display: block; margin-top: 5px; color: #536079; font-size: 9px; }
 input, select, textarea {
   width: 100%;
   border: 1px solid #222c43;
