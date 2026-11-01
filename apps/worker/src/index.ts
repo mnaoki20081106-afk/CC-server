@@ -5,6 +5,7 @@ import {
   listPanels, createPanel, getPanel, updatePanelPost, listPanelButtons, createPanelButton, deletePanelButton, getPanelButton,
   getAvConfig, upsertAvConfig, cleanExpiredAvSessions,
   replaceBotGuildCache, listBotGuildCache,
+  listExternalAuths, insertExternalAuth, deleteExternalAuth,
 } from "./db";
 import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
 import { sha256Hex, randomToken, corsHeaders, json, HttpError } from "./utils";
@@ -352,6 +353,32 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
       await deleteRole(env, guildId, roleId);
       return json({ ok: true }, { env });
     }
+  }
+
+  // GET/POST /api/guilds/:id/external-auths
+  if (sub === "/external-auths") {
+    if (method === "GET") return json(await listExternalAuths(env, guildId), { env });
+    if (method === "POST") {
+      const input = await request.json() as { name?: string; url?: string };
+      const name = String(input.name ?? "").trim();
+      const rawUrl = String(input.url ?? "").trim();
+      if (!name || name.length > 80) throw new HttpError(400, "名前を入力してください（80文字以内）");
+      if (!/^https:\/\/discord\.com\/oauth2\/authorize\?/.test(rawUrl)) {
+        throw new HttpError(400, "Discord OAuthのURLを入力してください（https://discord.com/oauth2/authorize?...）");
+      }
+      const id = randomToken(16);
+      await insertExternalAuth(env, { id, guild_id: guildId, name, url: rawUrl, created_at: Date.now() });
+      return json({ ok: true, id }, { status: 201, env });
+    }
+  }
+
+  // DELETE /api/guilds/:id/external-auths/:id
+  const externalAuthItemMatch = sub.match(/^\/external-auths\/([^/]+)$/);
+  if (externalAuthItemMatch && method === "DELETE") {
+    if (!(await deleteExternalAuth(env, externalAuthItemMatch[1]!, guildId))) {
+      throw new HttpError(404, "見つかりません");
+    }
+    return json({ ok: true }, { env });
   }
 
   // GET /api/guilds/:id/security-center

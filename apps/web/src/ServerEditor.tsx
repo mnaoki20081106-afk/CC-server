@@ -59,6 +59,54 @@ const CHANNEL_PERMISSION_GROUPS: Array<{ title: string; keys: Array<[string, str
 
 const CHANNEL_TYPE_LABEL: Record<number, string> = { 0: "テキスト", 2: "ボイス", 4: "カテゴリ", 5: "アナウンス" };
 
+// ── role permission groups (xaccount-bot's RoleManager.tsx, ported verbatim) ─
+type RolePermissionItem = { key: string; label: string; description: string; bit: bigint };
+type RolePermissionGroup = { title: string; items: RolePermissionItem[] };
+
+const ROLE_PERMISSION_GROUPS: RolePermissionGroup[] = [
+  {
+    title: "管理",
+    items: [
+      { key: "administrator", label: "Administrator", description: "すべての権限を持つ最上位権限", bit: 8n },
+      { key: "manageGuild", label: "サーバー管理", description: "サーバー設定を変更", bit: 32n },
+      { key: "manageChannels", label: "チャンネル管理", description: "チャンネルの作成・編集・削除", bit: 16n },
+      { key: "manageRoles", label: "ロール管理", description: "下位ロールの作成・編集・付与", bit: 268435456n },
+      { key: "viewAuditLog", label: "監査ログを見る", description: "サーバー監査ログを閲覧", bit: 128n },
+    ],
+  },
+  {
+    title: "モデレーション",
+    items: [
+      { key: "kick", label: "メンバーをKick", description: "メンバーをサーバーから退出させる", bit: 2n },
+      { key: "ban", label: "メンバーをBan", description: "メンバーをBan / Unban", bit: 4n },
+      { key: "moderate", label: "タイムアウト", description: "メンバーをタイムアウト", bit: 1099511627776n },
+      { key: "manageMessages", label: "メッセージ管理", description: "他ユーザーのメッセージ削除など", bit: 8192n },
+    ],
+  },
+  {
+    title: "テキスト・コミュニティ",
+    items: [
+      { key: "viewChannel", label: "チャンネルを見る", description: "閲覧可能なチャンネルにアクセス", bit: 1024n },
+      { key: "sendMessages", label: "メッセージを送信", description: "テキストチャンネルへ投稿", bit: 2048n },
+      { key: "mentionEveryone", label: "@everyone をメンション", description: "@everyone / @here を使用", bit: 131072n },
+      { key: "manageThreads", label: "スレッド管理", description: "スレッドの編集・削除", bit: 17179869184n },
+      { key: "manageWebhooks", label: "Webhook管理", description: "Webhookの作成・編集・削除", bit: 536870912n },
+    ],
+  },
+  {
+    title: "ボイス",
+    items: [
+      { key: "connect", label: "接続", description: "ボイスチャンネルへ接続", bit: 1048576n },
+      { key: "speak", label: "発言", description: "ボイスチャンネルで発言", bit: 2097152n },
+    ],
+  },
+];
+
+function roleColorHex(color: number): string {
+  const safe = Number.isFinite(color) ? Math.max(0, Math.min(0xffffff, color)) : 0;
+  return "#" + safe.toString(16).padStart(6, "0");
+}
+
 type PermissionMode = "inherit" | "allow" | "deny";
 
 function nextMode(mode: PermissionMode): PermissionMode {
@@ -185,8 +233,14 @@ function ChannelRoleEditor({ guildId }: { guildId: string }) {
   const [newChannelType, setNewChannelType] = useState<"text" | "voice" | "category">("text");
   const [newChannelParent, setNewChannelParent] = useState("");
 
-  const [newRoleName, setNewRoleName] = useState("");
-  const [newRoleColor, setNewRoleColor] = useState("#5865f2");
+  // role editor (ported from xaccount-bot's RoleManager.tsx)
+  const [selectedRoleId, setSelectedRoleId] = useState("");
+  const [roleCreating, setRoleCreating] = useState(false);
+  const [roleName, setRoleName] = useState("");
+  const [roleColor, setRoleColor] = useState(0);
+  const [roleColorHexInput, setRoleColorHexInput] = useState("#000000");
+  const [rolePermissions, setRolePermissions] = useState(0n);
+  const [roleSaving, setRoleSaving] = useState(false);
 
   const [permChannelId, setPermChannelId] = useState("");
   const [permTargetId, setPermTargetId] = useState("");
@@ -252,33 +306,76 @@ function ChannelRoleEditor({ guildId }: { guildId: string }) {
     } catch (reason) { fail(reason); } finally { setBusy(false); setDragging(null); }
   }
 
-  async function createRole() {
-    if (!newRoleName.trim()) return;
-    setBusy(true);
-    try {
-      const color = parseInt(newRoleColor.replace("#", ""), 16) || 0;
-      await api(`/api/guilds/${guildId}/roles`, { method: "POST", body: JSON.stringify({ name: newRoleName.trim(), color }) });
-      setNewRoleName("");
-      await load();
-      flash("ロールを作成しました");
-    } catch (reason) { fail(reason); } finally { setBusy(false); }
+  const selectedRole = roles.find(r => r.id === selectedRoleId) ?? null;
+
+  function loadRole(role: EditorRole) {
+    setRoleCreating(false);
+    setSelectedRoleId(role.id);
+    setRoleName(role.name);
+    setRoleColor(role.color ?? 0);
+    setRoleColorHexInput(roleColorHex(role.color ?? 0));
+    setRolePermissions(BigInt(role.permissions || "0"));
   }
 
-  async function renameRole(role: EditorRole, name: string) {
-    setBusy(true);
-    try {
-      await api(`/api/guilds/${guildId}/roles/${role.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-      await load();
-    } catch (reason) { fail(reason); } finally { setBusy(false); }
+  useEffect(() => {
+    if (roleCreating) return;
+    if (selectedRole) return;
+    const fallback = roles.find(r => r.isEveryone) ?? roles[0] ?? null;
+    if (fallback) loadRole(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roles]);
+
+  function startCreateRole() {
+    setRoleCreating(true);
+    setSelectedRoleId("");
+    setRoleName("");
+    setRoleColor(0);
+    setRoleColorHexInput("#000000");
+    setRolePermissions(0n);
   }
 
-  async function deleteRole(role: EditorRole) {
-    setBusy(true);
+  function toggleRolePermission(bit: bigint) {
+    setRolePermissions(current => ((current & bit) === bit ? current & ~bit : current | bit));
+  }
+
+  function applyRoleColorHex(value: string) {
+    setRoleColorHexInput(value);
+    if (/^#[0-9a-fA-F]{6}$/.test(value)) setRoleColor(parseInt(value.slice(1), 16));
+  }
+
+  async function saveRole() {
+    const name = roleName.trim();
+    if (roleCreating && !name) return;
+    if (!roleCreating && !selectedRole) return;
+    setRoleSaving(true);
     try {
-      await api(`/api/guilds/${guildId}/roles/${role.id}`, { method: "DELETE" });
+      if (roleCreating) {
+        await api(`/api/guilds/${guildId}/roles`, {
+          method: "POST",
+          body: JSON.stringify({ name, color: roleColor, permissions: rolePermissions.toString() }),
+        });
+        await load();
+        flash("ロールを追加しました");
+      } else if (selectedRole) {
+        const payload = selectedRole.isEveryone
+          ? { permissions: rolePermissions.toString() }
+          : { name, color: roleColor, permissions: rolePermissions.toString() };
+        await api(`/api/guilds/${guildId}/roles/${selectedRole.id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        await load();
+        flash(selectedRole.isEveryone ? "@everyone の権限を保存しました" : "ロールを保存しました");
+      }
+    } catch (reason) { fail(reason); } finally { setRoleSaving(false); }
+  }
+
+  async function deleteRole() {
+    if (!selectedRole || selectedRole.isEveryone) return;
+    if (!window.confirm(`ロール「${selectedRole.name}」を削除しますか？`)) return;
+    setRoleSaving(true);
+    try {
+      await api(`/api/guilds/${guildId}/roles/${selectedRole.id}`, { method: "DELETE" });
       await load();
       flash("ロールを削除しました");
-    } catch (reason) { fail(reason); } finally { setBusy(false); }
+    } catch (reason) { fail(reason); } finally { setRoleSaving(false); }
   }
 
   async function savePermissions() {
@@ -380,44 +477,123 @@ function ChannelRoleEditor({ guildId }: { guildId: string }) {
         </div>
       </div>
 
-      <div className="card" style={{ padding: 24 }}>
-        <div className="section-head">
-          <h2>ロール管理</h2>
-        </div>
-        <div className="form-grid three">
-          <Field label="ロール名">
-            <input value={newRoleName} onChange={e => setNewRoleName(e.target.value)} />
-          </Field>
-          <Field label="色">
-            <input type="color" value={newRoleColor} onChange={e => setNewRoleColor(e.target.value)} />
-          </Field>
-        </div>
-        <div className="button-row">
-          <button type="button" className="primary" onClick={() => void createRole()} disabled={busy}>
-            作成
+      <section className="card role-manager-card">
+        <div className="section-head role-manager-heading">
+          <div>
+            <span className="eyebrow">ROLE MANAGER</span>
+            <h2>ロール管理</h2>
+            <p className="muted">ロールの追加・削除・色変更と、サーバー全体の権限を設定できます。</p>
+          </div>
+          <button type="button" className="primary" onClick={startCreateRole} disabled={roleSaving}>
+            ＋ ロール追加
           </button>
         </div>
 
-        <div className="stack" style={{ marginTop: 16 }}>
-          {roles.map(role => (
-            <div key={role.id} className="toggle-row">
-              <span className="toggle-copy">
-                <strong style={{ color: role.color ? `#${role.color.toString(16).padStart(6, "0")}` : undefined }}>@{role.name}</strong>
-              </span>
-              {!role.isEveryone && (
-                <div className="button-row" style={{ marginTop: 0 }}>
-                  <button type="button" className="secondary" onClick={() => { const name = window.prompt("新しいロール名", role.name); if (name) void renameRole(role, name); }}>
-                    名前変更
-                  </button>
-                  <button type="button" className="danger" onClick={() => void deleteRole(role)}>
-                    削除
-                  </button>
-                </div>
+        <div className="role-manager-layout">
+          <div className="role-manager-list">
+            {roles.map(role => (
+              <button
+                type="button"
+                key={role.id}
+                className={!roleCreating && selectedRoleId === role.id ? "role-manager-item active" : "role-manager-item"}
+                onClick={() => loadRole(role)}
+              >
+                <span className="role-color-dot" style={{ backgroundColor: role.color ? roleColorHex(role.color) : "#747f8d" }} />
+                <span className="role-manager-item-copy">
+                  <strong>{role.isEveryone ? "@everyone" : role.name}</strong>
+                  <small>{role.isEveryone ? "BASE ROLE" : `POSITION ${role.position}`}</small>
+                </span>
+                <span className="role-manager-chevron">›</span>
+              </button>
+            ))}
+            {roles.length === 0 && <div className="role-manager-empty">まだ編集可能なロールがありません。</div>}
+          </div>
+
+          <form className="role-manager-editor" onSubmit={e => { e.preventDefault(); void saveRole(); }}>
+            <div className="role-editor-title">
+              <div>
+                <span className="eyebrow">{roleCreating ? "CREATE ROLE" : "EDIT ROLE"}</span>
+                <h3>{roleCreating ? "新しいロール" : selectedRole?.isEveryone ? "@everyone" : selectedRole?.name ?? "ロールを選択"}</h3>
+              </div>
+              {!roleCreating && selectedRole && !selectedRole.isEveryone && (
+                <button type="button" className="danger" disabled={roleSaving} onClick={() => void deleteRole()}>
+                  削除
+                </button>
               )}
             </div>
-          ))}
+
+            {(roleCreating || selectedRole) && (
+              <>
+                {!selectedRole?.isEveryone && (
+                  <div className="role-basic-grid">
+                    <label>
+                      <span>ロール名</span>
+                      <input required maxLength={100} value={roleName} onChange={e => setRoleName(e.target.value)} placeholder="Moderator" />
+                    </label>
+                    <label>
+                      <span>ロール色</span>
+                      <div className="role-color-editor">
+                        <input
+                          className="role-color-input"
+                          type="color"
+                          value={roleColorHex(roleColor)}
+                          onChange={e => { setRoleColorHexInput(e.target.value); setRoleColor(parseInt(e.target.value.slice(1), 16)); }}
+                        />
+                        <input className="role-hex-input" value={roleColorHexInput} onChange={e => applyRoleColorHex(e.target.value)} maxLength={7} spellCheck={false} />
+                        <button type="button" className="secondary" onClick={() => { setRoleColor(0); setRoleColorHexInput("#000000"); }}>
+                          既定色
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+                )}
+
+                {selectedRole?.isEveryone && (
+                  <div className="role-everyone-note">
+                    <strong>@everyone</strong>
+                    <span>全メンバーの基礎ロールです。名前・色・削除は変更できませんが、サーバー全体の権限は編集できます。</span>
+                  </div>
+                )}
+
+                <div className="role-permission-groups">
+                  {ROLE_PERMISSION_GROUPS.map(group => (
+                    <section className="role-permission-group" key={group.title}>
+                      <h4>{group.title}</h4>
+                      <div className="role-permission-list">
+                        {group.items.map(permission => {
+                          const checked = (rolePermissions & permission.bit) === permission.bit;
+                          return (
+                            <label className={checked ? "role-permission-row enabled" : "role-permission-row"} key={permission.key}>
+                              <span className="role-permission-copy">
+                                <strong>{permission.label}</strong>
+                                <small>{permission.description}</small>
+                              </span>
+                              <span className={checked ? "role-permission-switch on" : "role-permission-switch"}>
+                                <input type="checkbox" checked={checked} onChange={() => toggleRolePermission(permission.bit)} />
+                                <span />
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+
+                {(rolePermissions & 8n) === 8n && (
+                  <div className="role-admin-warning">
+                    Administrator はチャンネル個別設定を含む全権限を実質的に許可します。
+                  </div>
+                )}
+
+                <button className="primary role-save-button" type="submit" disabled={roleSaving}>
+                  {roleSaving ? "保存中…" : roleCreating ? "ロールを追加" : "変更を保存"}
+                </button>
+              </>
+            )}
+          </form>
         </div>
-      </div>
+      </section>
 
       <div className="card" style={{ padding: 24 }}>
         <div className="section-head">

@@ -87,6 +87,15 @@ const SCHEMA_STATEMENTS = [
     seen_at INTEGER NOT NULL
   )`,
 
+  `CREATE TABLE IF NOT EXISTS external_auths (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS external_auths_guild_idx ON external_auths(guild_id)`,
+
   ...SECURITY_SCHEMA_STATEMENTS,
   ...BACKUP_SCHEMA_STATEMENTS,
   ...MEMBER_ACTIVITY_SCHEMA_STATEMENTS,
@@ -252,4 +261,26 @@ export async function listBotGuildCache(env: Env, maxAgeMs = 24 * 60 * 60_000): 
     "SELECT guild_id AS id, name, icon FROM bot_guild_cache WHERE seen_at>=? ORDER BY name COLLATE NOCASE"
   ).bind(Date.now() - maxAgeMs).all<CachedBotGuild>();
   return results;
+}
+
+// ── external auths ───────────────────────────────────────────────────────────
+
+export type ExternalAuth = { id: string; name: string; url: string };
+
+export async function listExternalAuths(env: Env, guildId: string): Promise<ExternalAuth[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT id, name, url FROM external_auths WHERE guild_id=? ORDER BY created_at"
+  ).bind(guildId).all<ExternalAuth>();
+  return results;
+}
+
+export async function insertExternalAuth(env: Env, row: { id: string; guild_id: string; name: string; url: string; created_at: number }): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO external_auths(id,guild_id,name,url,created_at) VALUES(?,?,?,?,?)"
+  ).bind(row.id, row.guild_id, row.name, row.url, row.created_at).run();
+}
+
+export async function deleteExternalAuth(env: Env, id: string, guildId: string): Promise<boolean> {
+  const result = await env.DB.prepare("DELETE FROM external_auths WHERE id=? AND guild_id=?").bind(id, guildId).run();
+  return (result.meta.changes ?? 0) > 0;
 }

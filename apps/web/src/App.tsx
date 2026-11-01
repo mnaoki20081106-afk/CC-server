@@ -6,6 +6,7 @@ import Panels, { type Panel, type PanelButton } from "./Panels";
 import AmazonVending, { type AvConfig } from "./AmazonVending";
 import BackupManager from "./BackupManager";
 import MemberActivityManager from "./MemberActivityManager";
+import ExternalAuthManager from "./ExternalAuthManager";
 
 type Guild = { id: string; name: string; icon: string | null };
 type Channel = { id: string; name: string; type: number; parent_id: string | null };
@@ -371,7 +372,12 @@ export default function App() {
               </button>
             </nav>
 
-            {activeTab === "server" && <ServerEditor meta={meta} config={config} onSave={patch => void saveConfig(patch, "サーバー設定を保存しました")} />}
+            {activeTab === "server" && (
+              <>
+                <ServerEditor meta={meta} config={config} onSave={patch => void saveConfig(patch, "サーバー設定を保存しました")} />
+                <ExternalAuthManager guildId={selectedGuild.id} />
+              </>
+            )}
             {activeTab === "security" && <SecurityManager guildId={selectedGuild.id} channels={meta.channels} />}
             {activeTab === "panels" && (
               <Panels
