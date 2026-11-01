@@ -62,8 +62,6 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const service = await api<ServiceStatus>("/api/status");
-      setStatus(service);
       const serverList = await api<Guild[]>("/api/guilds");
       setGuilds(serverList);
       if (!selectedId && serverList.length > 0) await selectGuild(serverList[0].id);
@@ -71,6 +69,15 @@ export default function App() {
       fail(reason);
     } finally {
       setBusy(false);
+    }
+
+    // /api/status is a nice-to-have (bot health pill + invite link) — a
+    // Worker deploy that doesn't have this route yet, or a transient
+    // failure, must not block the guild list above.
+    try {
+      setStatus(await api<ServiceStatus>("/api/status"));
+    } catch {
+      setStatus(null);
     }
   }
 
