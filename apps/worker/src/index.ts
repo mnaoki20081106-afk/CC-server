@@ -9,6 +9,12 @@ import {
 import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
 import { sha256Hex, randomToken, corsHeaders, json } from "./utils";
 import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal } from "./amazon-vending";
+import {
+  getSecurityOverview, updateSecuritySettings, triggerLockdown, releaseLockdown,
+  ensureSecurityGatewayRunning, runSecurityScheduled,
+} from "./security/service";
+
+export { DiscordSecurityGateway } from "./security/gateway";
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -133,7 +139,7 @@ async function handleInteraction(request: Request, env: Env, ctx: ExecutionConte
 
 // ── admin API ─────────────────────────────────────────────────────────────────
 
-async function handleApi(request: Request, env: Env, url: URL): Promise<Response> {
+async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionContext): Promise<Response> {
   const path = url.pathname;
   const method = request.method;
 
@@ -239,6 +245,31 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       await updateGuildConfig(env, guildId, fields);
       return json({ ok: true }, { env });
     }
+  }
+
+  // GET /api/guilds/:id/security-center
+  if (sub === "/security-center" && method === "GET") {
+    ctx.waitUntil(ensureSecurityGatewayRunning(env).catch(err => console.error("security gateway start failed", err)));
+    return json(await getSecurityOverview(env, guildId), { env });
+  }
+
+  // PUT /api/guilds/:id/security-center/settings
+  if (sub === "/security-center/settings" && method === "PUT") {
+    const body = await request.json();
+    return json(await updateSecuritySettings(env, guildId, body), { env });
+  }
+
+  // POST /api/guilds/:id/security-center/lockdown
+  if (sub === "/security-center/lockdown" && method === "POST") {
+    const body = await request.json().catch(() => ({})) as { minutes?: number };
+    return json(await triggerLockdown(env, guildId, body.minutes), { env });
+  }
+
+  // DELETE /api/guilds/:id/security-center/lockdown
+  if (sub === "/security-center/lockdown" && method === "DELETE") {
+    const result = await releaseLockdown(env, guildId);
+    if ("error" in result) return json(result, { status: 409, env });
+    return json(result, { env });
   }
 
   // GET /api/guilds/:id/panels
@@ -379,7 +410,7 @@ export default {
       }
 
       if (url.pathname.startsWith("/api/")) {
-        const res = await handleApi(request, env, url);
+        const res = await handleApi(request, env, url, ctx);
         return res;
       }
 
@@ -400,6 +431,7 @@ export default {
     ctx.waitUntil(Promise.all([
       ensureSchema(env).then(() => cleanExpiredSessions(env)).catch(console.error),
       ensureSchema(env).then(() => cleanExpiredAvSessions(env)).catch(console.error),
+      ensureSchema(env).then(() => runSecurityScheduled(env)).catch(err => console.error("security scheduled run failed", err)),
     ]));
   },
 } satisfies ExportedHandler<Env>;

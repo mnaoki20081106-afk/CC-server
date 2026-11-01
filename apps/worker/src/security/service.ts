@@ -8,7 +8,8 @@
 // DASHBOARD_PASSWORD session check. So: no HMAC verification, no security
 // floor to enforce against an untrusted bridge caller (the dashboard IS the
 // trusted operator here), no service-bot/maintenance routes (see db.ts).
-import type { Env, MaintenanceScope, SecuritySettings } from "./types";
+import type { Env } from "../types";
+import type { SecuritySettings } from "./types";
 import {
   cleanExpired, getLockdownSnapshot, getSecuritySettings, listExpiredLockdowns, listIncidents, saveSecuritySettings,
 } from "./db";
@@ -16,7 +17,6 @@ import { botJson, enterLockdown, exitLockdown, getGuildSafetyStatus, getSecurity
 import { DiscordSecurityGateway, ensureDiscordSecurityGateway, gatewayStatus, reconcileDiscordSecurityAudits } from "./gateway";
 
 export { DiscordSecurityGateway };
-void (null as unknown as MaintenanceScope); // re-exported type import kept for callers; unused at runtime
 
 async function invalidateGatewaySettings(env: Env, guildId: string): Promise<void> {
   const id = env.SECURITY_GATEWAY.idFromName("discord-security");

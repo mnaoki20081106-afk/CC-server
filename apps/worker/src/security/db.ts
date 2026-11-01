@@ -12,7 +12,7 @@
 //   multi-bot deployment. SecuritySettings.allowedBotIds already covers
 //   "trust this other bot" for cc-server's single-bot case.
 import type { Env } from "../types";
-import type { MaintenanceScope, SecurityIncident, SecuritySettings } from "./types";
+import type { SecurityIncident, SecuritySettings } from "./types";
 
 export const SECURITY_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS security_settings (
@@ -202,7 +202,6 @@ export async function listIncidents(env: Env, guildId: string, limit = 30): Prom
 // since engine.ts's trusted() already exempts the bot's own actions by
 // identity, which is what leases existed to approximate for a *different*
 // bot's edits.
-export type { MaintenanceScope };
 export async function hasMaintenanceLease(): Promise<boolean> { return false; }
 export async function hasGuildMaintenanceLease(): Promise<boolean> { return false; }
 

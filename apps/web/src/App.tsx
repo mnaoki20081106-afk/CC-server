@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, clearSession, currentSession, login } from "./api";
 import ServerEditor, { type ServerConfig } from "./ServerEditor";
-import SecurityManager, { type SecurityConfig } from "./SecurityManager";
+import SecurityManager from "./SecurityManager";
 import Panels, { type Panel, type PanelButton } from "./Panels";
 import AmazonVending, { type AvConfig } from "./AmazonVending";
 
@@ -10,7 +10,7 @@ type Channel = { id: string; name: string; type: number; parent_id: string | nul
 type Role = { id: string; name: string; color: number };
 type Meta = { id: string; name: string; icon: string | null; channels: Channel[]; roles: Role[] };
 
-type GuildConfig = ServerConfig & SecurityConfig;
+type GuildConfig = ServerConfig;
 
 type ServiceStatus = {
   discordReady: boolean;
@@ -364,9 +364,7 @@ export default function App() {
             </nav>
 
             {activeTab === "server" && <ServerEditor meta={meta} config={config} onSave={patch => void saveConfig(patch, "サーバー設定を保存しました")} />}
-            {activeTab === "security" && (
-              <SecurityManager channels={meta.channels} config={config} onSave={patch => void saveConfig(patch, "セキュリティ設定を保存しました")} />
-            )}
+            {activeTab === "security" && <SecurityManager guildId={selectedGuild.id} channels={meta.channels} />}
             {activeTab === "panels" && (
               <Panels
                 meta={meta}
