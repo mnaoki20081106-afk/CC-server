@@ -101,6 +101,13 @@ async function enterApp() {
 function renderGuildList() {
   const el = document.getElementById('guild-list');
   el.innerHTML = '';
+  if (guilds.length === 0) {
+    const msg = document.createElement('div');
+    msg.className = 'guild-empty';
+    msg.textContent = 'Botがまだどのサーバーにも参加していません。Discordでサーバーに招待してください。';
+    el.appendChild(msg);
+    return;
+  }
   for (const g of guilds) {
     const item = document.createElement('div');
     item.className = 'guild-item' + (currentGuild?.id === g.id ? ' active' : '');
@@ -113,20 +120,28 @@ function renderGuildList() {
 async function selectGuild(g) {
   currentGuild = g;
   document.querySelectorAll('.guild-item').forEach(el => el.classList.toggle('active', el.textContent === g.name));
-  document.getElementById('no-guild').classList.add('hidden');
-  document.getElementById('guild-panel').classList.remove('hidden');
 
-  // fetch meta + config in parallel
-  const [meta, cfg] = await Promise.all([
-    api('GET', `/api/guilds/${g.id}/meta`),
-    api('GET', `/api/guilds/${g.id}/config`),
-  ]);
-  currentMeta = meta;
-  currentConfig = cfg;
+  try {
+    // fetch meta + config in parallel
+    const [meta, cfg] = await Promise.all([
+      api('GET', `/api/guilds/${g.id}/meta`),
+      api('GET', `/api/guilds/${g.id}/config`),
+    ]);
+    currentMeta = meta;
+    currentConfig = cfg;
 
-  populateSelects();
-  populateConfig();
-  switchTab('config');
+    document.getElementById('no-guild').classList.add('hidden');
+    document.getElementById('guild-panel').classList.remove('hidden');
+
+    populateSelects();
+    populateConfig();
+    switchTab('config');
+  } catch (err) {
+    currentGuild = null;
+    document.getElementById('no-guild').textContent = `読み込みに失敗しました: ${err.message}`;
+    document.getElementById('no-guild').classList.remove('hidden');
+    document.getElementById('guild-panel').classList.add('hidden');
+  }
 }
 
 // ── selects ───────────────────────────────────────────────────────────────────
