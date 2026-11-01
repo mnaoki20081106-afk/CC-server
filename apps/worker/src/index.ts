@@ -7,18 +7,18 @@ import {
   replaceBotGuildCache, listBotGuildCache,
 } from "./db";
 import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
-import { sha256Hex, randomToken, corsHeaders, json } from "./utils";
+import { sha256Hex, randomToken, corsHeaders, json, HttpError } from "./utils";
 import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal } from "./amazon-vending";
 import {
   getSecurityOverview, updateSecuritySettings, triggerLockdown, releaseLockdown,
   ensureSecurityGatewayRunning, runSecurityScheduled,
 } from "./security/service";
+import {
+  getServerEditorData, createChannel, reorderChannel, createRole, patchRole, deleteRole,
+  patchChannelPermission, bulkChannelPermissions,
+} from "./server-editor";
 
 export { DiscordSecurityGateway } from "./security/gateway";
-
-class HttpError extends Error {
-  constructor(public status: number, message: string) { super(message); }
-}
 
 // Invite / applications.commands + manage roles, channels, messages — the
 // permissions cc-server's features actually use.
@@ -243,6 +243,57 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
       const fields: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(body)) if (ALLOWED.has(k)) fields[k] = v;
       await updateGuildConfig(env, guildId, fields);
+      return json({ ok: true }, { env });
+    }
+  }
+
+  // GET /api/guilds/:id/server-editor — channels (all types) + roles (incl. @everyone)
+  if (sub === "/server-editor" && method === "GET") {
+    return json(await getServerEditorData(env, guildId), { env });
+  }
+
+  // POST /api/guilds/:id/channels
+  if (sub === "/channels" && method === "POST") {
+    const body = await request.json() as Parameters<typeof createChannel>[2];
+    return json(await createChannel(env, guildId, body), { status: 201, env });
+  }
+
+  // PATCH /api/guilds/:id/channels/reorder
+  if (sub === "/channels/reorder" && method === "PATCH") {
+    const body = await request.json() as Parameters<typeof reorderChannel>[2];
+    return json(await reorderChannel(env, guildId, body), { env });
+  }
+
+  // PATCH /api/guilds/:id/channels/permissions/bulk
+  if (sub === "/channels/permissions/bulk" && method === "PATCH") {
+    const body = await request.json() as Parameters<typeof bulkChannelPermissions>[2];
+    return json(await bulkChannelPermissions(env, guildId, body), { env });
+  }
+
+  // PATCH /api/guilds/:id/channels/:channelId/permissions/:targetId
+  const channelPermMatch = sub.match(/^\/channels\/(\d+)\/permissions\/(\d+)$/);
+  if (channelPermMatch && method === "PATCH") {
+    const [, channelId, targetId] = channelPermMatch as [string, string, string];
+    const body = await request.json() as { permissions?: Record<string, string> };
+    return json(await patchChannelPermission(env, guildId, channelId, targetId, body.permissions ?? {}), { env });
+  }
+
+  // POST /api/guilds/:id/roles
+  if (sub === "/roles" && method === "POST") {
+    const body = await request.json() as Parameters<typeof createRole>[2];
+    return json(await createRole(env, guildId, body), { status: 201, env });
+  }
+
+  // PATCH/DELETE /api/guilds/:id/roles/:roleId
+  const roleItemMatch = sub.match(/^\/roles\/(\d+)$/);
+  if (roleItemMatch) {
+    const roleId = roleItemMatch[1]!;
+    if (method === "PATCH") {
+      const body = await request.json() as Parameters<typeof patchRole>[3];
+      return json(await patchRole(env, guildId, roleId, body), { env });
+    }
+    if (method === "DELETE") {
+      await deleteRole(env, guildId, roleId);
       return json({ ok: true }, { env });
     }
   }

@@ -51,11 +51,21 @@ export async function botJson<T>(env: Env, path: string, init: RequestInit = {})
   return res.json() as Promise<T>;
 }
 
+export interface DiscordPermissionOverwrite {
+  id: string;
+  type: number; // 0 = role, 1 = member
+  allow: string;
+  deny: string;
+}
+
 export interface DiscordChannel {
   id: string;
   name: string;
   type: number;
   parent_id?: string | null;
+  position?: number;
+  topic?: string | null;
+  permission_overwrites?: DiscordPermissionOverwrite[];
 }
 
 export interface DiscordRole {
@@ -64,4 +74,6 @@ export interface DiscordRole {
   color: number;
   position: number;
   managed: boolean;
+  permissions?: string;
+  tags?: { bot_id?: string };
 }
