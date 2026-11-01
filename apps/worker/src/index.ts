@@ -17,6 +17,9 @@ import {
   getServerEditorData, createChannel, reorderChannel, createRole, patchRole, deleteRole,
   patchChannelPermission, bulkChannelPermissions,
 } from "./server-editor";
+import {
+  createBackup, listBackups, deleteBackup, previewRestore, startRestore, listRestoreJobs, getRestoreJobPublic,
+} from "./backup";
 
 export { DiscordSecurityGateway } from "./security/gateway";
 
@@ -30,7 +33,8 @@ const BOT_PERMISSIONS = (
   1n << 13n |  // MANAGE_MESSAGES
   1n << 16n |  // READ_MESSAGE_HISTORY
   1n << 28n |  // MANAGE_ROLES
-  1n << 2n     // BAN_MEMBERS
+  1n << 2n |   // BAN_MEMBERS
+  1n << 5n     // MANAGE_GUILD (needed for backup/restore: guild settings + welcome screen)
 ).toString();
 
 // ── auth ──────────────────────────────────────────────────────────────────────
@@ -201,6 +205,48 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
     }
   }
 
+  // GET /api/backups
+  if (path === "/api/backups" && method === "GET") {
+    return json(await listBackups(env), { env });
+  }
+
+  // DELETE /api/backups/:id
+  const backupItemMatch = path.match(/^\/api\/backups\/([^/]+)$/);
+  if (backupItemMatch && method === "DELETE") {
+    await deleteBackup(env, backupItemMatch[1]!);
+    return json({ ok: true }, { env });
+  }
+
+  // POST /api/backups/:id/restore/preview
+  const previewMatch = path.match(/^\/api\/backups\/([^/]+)\/restore\/preview$/);
+  if (previewMatch && method === "POST") {
+    const { target_guild_id } = await request.json() as { target_guild_id?: string };
+    if (!target_guild_id) throw new HttpError(400, "target_guild_id required");
+    return json(await previewRestore(env, previewMatch[1]!, target_guild_id), { env });
+  }
+
+  // POST /api/backups/:id/restore
+  const restoreMatch = path.match(/^\/api\/backups\/([^/]+)\/restore$/);
+  if (restoreMatch && method === "POST") {
+    const { target_guild_id } = await request.json() as { target_guild_id?: string };
+    if (!target_guild_id) throw new HttpError(400, "target_guild_id required");
+    const job = await startRestore(env, restoreMatch[1]!, target_guild_id, ctx);
+    return json(job, { env });
+  }
+
+  // GET /api/restore-jobs?target_guild_id=...
+  if (path === "/api/restore-jobs" && method === "GET") {
+    const targetGuildId = url.searchParams.get("target_guild_id");
+    if (!targetGuildId) throw new HttpError(400, "target_guild_id required");
+    return json(await listRestoreJobs(env, targetGuildId), { env });
+  }
+
+  // GET /api/restore-jobs/:id
+  const jobMatch = path.match(/^\/api\/restore-jobs\/([^/]+)$/);
+  if (jobMatch && method === "GET") {
+    return json(await getRestoreJobPublic(env, jobMatch[1]!), { env });
+  }
+
   // /api/guilds/:guildId/...
   const guildMatch = path.match(/^\/api\/guilds\/(\d+)(\/.*)?$/);
   if (!guildMatch) throw new HttpError(404, "not found");
@@ -250,6 +296,13 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
   // GET /api/guilds/:id/server-editor — channels (all types) + roles (incl. @everyone)
   if (sub === "/server-editor" && method === "GET") {
     return json(await getServerEditorData(env, guildId), { env });
+  }
+
+  // POST /api/guilds/:id/backups
+  if (sub === "/backups" && method === "POST") {
+    const { label } = await request.json().catch(() => ({})) as { label?: string };
+    const guildConfig = await getGuildConfig(env, guildId);
+    return json(await createBackup(env, guildId, label ?? null, guildConfig), { env });
   }
 
   // POST /api/guilds/:id/channels

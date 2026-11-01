@@ -4,6 +4,7 @@ import ServerEditor, { type ServerConfig } from "./ServerEditor";
 import SecurityManager from "./SecurityManager";
 import Panels, { type Panel, type PanelButton } from "./Panels";
 import AmazonVending, { type AvConfig } from "./AmazonVending";
+import BackupManager from "./BackupManager";
 
 type Guild = { id: string; name: string; icon: string | null };
 type Channel = { id: string; name: string; type: number; parent_id: string | null };
@@ -20,7 +21,7 @@ type ServiceStatus = {
   inviteUrl: string;
 };
 
-type ActiveTab = "server" | "security" | "panels" | "amazon";
+type ActiveTab = "server" | "security" | "panels" | "amazon" | "backup";
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState(() => Boolean(currentSession()));
@@ -361,6 +362,9 @@ export default function App() {
               <button type="button" role="tab" aria-selected={activeTab === "amazon"} className={activeTab === "amazon" ? "active" : ""} onClick={() => setActiveTab("amazon")}>
                 Amazon自販機
               </button>
+              <button type="button" role="tab" aria-selected={activeTab === "backup"} className={activeTab === "backup" ? "active" : ""} onClick={() => setActiveTab("backup")}>
+                バックアップ
+              </button>
             </nav>
 
             {activeTab === "server" && <ServerEditor meta={meta} config={config} onSave={patch => void saveConfig(patch, "サーバー設定を保存しました")} />}
@@ -377,6 +381,7 @@ export default function App() {
               />
             )}
             {activeTab === "amazon" && avConfig && <AmazonVending meta={meta} avConfig={avConfig} onSave={saveAvConfig} onPost={postAvPanel} />}
+            {activeTab === "backup" && <BackupManager guildId={selectedGuild.id} onNotice={flash} onError={fail} />}
           </>
         )}
       </main>
