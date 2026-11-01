@@ -513,3 +513,26 @@ textarea { min-height: 92px; resize: vertical; }
 .external-auth-list { list-style: none; padding: 0; margin-top: 12px; }
 .external-auth-list li { padding: 10px 0; border-bottom: 1px solid #1b2538; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .external-auth-list small { color: #7f8da8; display: block; margin-top: 2px; }
+
+/* discord panel live preview */
+.wrap-row { flex-wrap: wrap; }
+.discord-panel-studio { margin: 24px 0; }
+.discord-panel-studio h3 { margin: 0; }
+.discord-panel-preview { background: #313338; padding: 20px; border-radius: 8px; color: #dbdee1; font: 14px/1.4 "gg sans", "Noto Sans", Arial, sans-serif; width: 100%; }
+.discord-panel-preview.is-mobile { max-width: 390px; }
+.discord-panel-embed { background: #2b2d31; border-left: 4px solid; border-radius: 4px; padding: 12px 16px 16px 12px; max-width: 520px; width: fit-content; min-width: 0; overflow-wrap: anywhere; }
+.discord-panel-preview .discord-panel-title { display: block; background: transparent; border: 0; border-radius: 2px; padding: 0; color: #f2f3f5; font-size: 16px; font-weight: 600; text-align: left; margin: 0 0 8px; line-height: 1.4; width: 100%; }
+.discord-panel-section { margin: 0 0 14px; border-radius: 2px; white-space: pre-wrap; }
+.discord-panel-section:last-child { margin-bottom: 0; }
+.discord-editable { cursor: text; }
+.discord-editable:hover, .discord-editable:focus-visible { outline: 1px dashed #949ba4; outline-offset: 3px; }
+.discord-panel-preview .discord-inline-input { color: #dbdee1; background: #232428; border: 1px solid #5865f2; border-radius: 3px; padding: 4px; width: 100%; max-width: 100%; min-width: 0; font: inherit; }
+.discord-panel-preview .discord-inline-input.discord-panel-title { font-weight: 600; font-size: 16px; }
+.discord-panel-footer { margin-top: 8px; padding-top: 8px; border-top: 1px solid #3f4248; color: #949ba4; font-size: 12px; }
+.discord-panel-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.discord-panel-preview .discord-action { padding: 6px 16px; border-radius: 3px; color: #fff; font-size: 14px; font-weight: 500; line-height: 20px; min-height: 32px; cursor: default; }
+.discord-action.style-1 { background: #5865f2; }
+.discord-action.style-2 { background: #4e5058; }
+.discord-action.style-3 { background: #248046; }
+.discord-action.style-4 { background: #da373c; }
+@media (max-width: 600px) { .discord-panel-preview { padding: 12px; } .discord-panel-embed { width: 100%; } }

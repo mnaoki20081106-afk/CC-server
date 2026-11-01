@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import DiscordPanelPreview from "./DiscordPanelPreview";
 
 type Channel = { id: string; name: string; type: number; parent_id: string | null };
 type Role = { id: string; name: string; color: number };
@@ -11,6 +12,13 @@ export type AvConfig = {
   api_type: string;
   api_key: string | null;
 };
+
+// Matches exactly what POST /api/guilds/:id/amazon-vending/panel sends
+// (apps/worker/src/index.ts): embed color 0xff9900, a single Primary-style
+// 🛒 "購入する" button, and the same default description fallback text.
+const AV_EMBED_COLOR = 0xff9900;
+const AV_DEFAULT_DESCRIPTION = "Amazon商品をLTCで購入できます。";
+const AV_FOOTER = "購入するボタンを押してAmazonのURLを入力してください";
 
 export default function AmazonVending({
   meta,
@@ -62,6 +70,18 @@ export default function AmazonVending({
             <input type="password" value={draft.api_key ?? ""} onChange={e => setDraft({ ...draft, api_key: e.target.value })} />
           </label>
         </div>
+
+        <DiscordPanelPreview
+          title={draft.panel_title}
+          description={draft.panel_description ?? ""}
+          footer={AV_FOOTER}
+          color={AV_EMBED_COLOR}
+          buttons={[{ label: "購入する", style: 1, emoji: "🛒" }]}
+          onTitleChange={value => setDraft({ ...draft, panel_title: value })}
+          onDescriptionChange={value => setDraft({ ...draft, panel_description: value })}
+          titlePlaceholder="Amazon自販機"
+          descriptionPlaceholder={AV_DEFAULT_DESCRIPTION}
+        />
       </div>
 
       <div className="card" style={{ padding: 24 }}>

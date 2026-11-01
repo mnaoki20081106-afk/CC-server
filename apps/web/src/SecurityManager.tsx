@@ -43,6 +43,15 @@ type SecuritySettings = {
 
 type SecurityIncident = { id: string; actorId: string | null; kind: string; severity: string; summary: string; createdAt: number };
 
+type GuildSafetyStatus = {
+  explicitContentFilter: number;
+  verificationLevel: number;
+  mfaLevel: number;
+  raidAlertsEnabled: boolean;
+  safetyAlertsChannelConfigured: boolean;
+  baselineReady: boolean;
+};
+
 type SecurityOverview = {
   settings: SecuritySettings;
   status: { connected: boolean; lastEventAt: number | null; reconnectAttempts: number };
@@ -50,6 +59,7 @@ type SecurityOverview = {
   lockdown: { active: boolean; expiresAt: number | null; reason: string | null; manualUnlockAllowed: boolean };
   capabilities: { administrator: boolean; requiredReady: boolean; missingPermissions: string[] };
   maximumInviteUrl: string;
+  safetyStatus: GuildSafetyStatus | null;
 };
 
 const MODULE_LABELS: Record<keyof SecurityModules, [string, string]> = {
@@ -111,6 +121,23 @@ export default function SecurityManager({ guildId, channels }: { guildId: string
   }
 
   useEffect(() => { void load(); }, [guildId]);
+
+  // Explicit refresh (the ボタン below) surfaces connection errors; this
+  // background poll stays quiet so a transient Gateway blip doesn't spam
+  // an error on every tick.
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await api<SecurityOverview>(`/api/guilds/${guildId}/security-center`);
+        if (cancelled) return;
+        setOverview(prev => (prev ? { ...prev, status: data.status, lockdown: data.lockdown, incidents: data.incidents } : data));
+      } catch {
+        // quiet
+      }
+    }, 10_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [guildId]);
 
   async function save() {
     if (!draft) return;
@@ -235,6 +262,61 @@ export default function SecurityManager({ guildId, channels }: { guildId: string
               />
             );
           })}
+        </div>
+      </div>
+
+      <div className="card" style={{ padding: 24 }}>
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">SERVER SAFETY</span>
+            <h2>Discord Safety Baseline</h2>
+            <p className="muted">Discord標準の安全フィルターも合わせて強制維持します。</p>
+          </div>
+          <strong>{overview.safetyStatus?.baselineReady ? "READY" : "CHECK"}</strong>
+        </div>
+
+        <div className="toggle-stack">
+          <Toggle
+            title="Explicit Content Filter: ALL MEMBERS"
+            description="常時有効にし、全メンバーのメディアをスキャンします"
+            value={draft.safety.enforceExplicitContentFilter}
+            onChange={value => setDraft({ ...draft, safety: { ...draft.safety, enforceExplicitContentFilter: value } })}
+          />
+        </div>
+
+        <div className="form-grid two">
+          <Field label="最低Verification Level">
+            <select
+              value={draft.safety.minimumVerificationLevel}
+              onChange={e => setDraft({ ...draft, safety: { ...draft.safety, minimumVerificationLevel: Number(e.target.value) } })}
+            >
+              <option value={0}>None</option>
+              <option value={1}>Low（メール認証）</option>
+              <option value={2}>Medium（推奨最低値）</option>
+              <option value={3}>High</option>
+              <option value={4}>Very High（電話番号認証）</option>
+            </select>
+          </Field>
+          <Field label="現在のExplicit Filter">
+            <input
+              readOnly
+              value={
+                overview.safetyStatus
+                  ? overview.safetyStatus.explicitContentFilter === 2
+                    ? "ALL MEMBERS"
+                    : overview.safetyStatus.explicitContentFilter === 1
+                      ? "MEMBERS WITHOUT ROLES"
+                      : "DISABLED"
+                  : "取得待ち"
+              }
+            />
+          </Field>
+          <Field label="Server 2FA">
+            <input readOnly value={overview.safetyStatus?.mfaLevel === 1 ? "ENABLED" : "DISABLED"} />
+          </Field>
+          <Field label="Raid Alerts">
+            <input readOnly value={overview.safetyStatus?.raidAlertsEnabled ? "ENABLED" : "DISABLED / UNKNOWN"} />
+          </Field>
         </div>
       </div>
 

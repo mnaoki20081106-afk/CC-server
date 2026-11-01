@@ -1,4 +1,5 @@
 import { useState } from "react";
+import DiscordPanelPreview, { type PreviewButton } from "./DiscordPanelPreview";
 
 type Channel = { id: string; name: string; type: number; parent_id: string | null };
 type Role = { id: string; name: string; color: number };
@@ -8,6 +9,12 @@ export type Panel = { id: number; title: string; description: string | null; mes
 export type PanelButton = { id: number; label: string; style: string; emoji: string | null; action_type: string; action_value: string };
 
 const STYLE_LABEL: Record<string, string> = { Primary: "青", Secondary: "グレー", Success: "緑", Danger: "赤" };
+// Matches the Discord component style ints the backend actually sends (see
+// apps/worker/src/index.ts STYLE_MAP + POST /panels/:id/post).
+const STYLE_INT: Record<string, 1 | 2 | 3 | 4> = { Primary: 1, Secondary: 2, Success: 3, Danger: 4 };
+// 0x9b59b6 — matches the embed color the backend actually posts in
+// POST /panels/:id/post.
+const PANEL_EMBED_COLOR = 0x9b59b6;
 
 export default function Panels({
   meta,
@@ -55,6 +62,17 @@ export default function Panels({
             作成
           </button>
         </div>
+
+        <DiscordPanelPreview
+          title={title}
+          description={desc}
+          color={PANEL_EMBED_COLOR}
+          buttons={[]}
+          onTitleChange={setTitle}
+          onDescriptionChange={setDesc}
+          titlePlaceholder="パネルタイトル"
+          descriptionPlaceholder="説明文（任意）"
+        />
       </div>
 
       {panels.map(p => (
@@ -91,6 +109,13 @@ function PanelCard({
         <h2>{panel.title}</h2>
       </div>
       {panel.description && <p className="muted">{panel.description}</p>}
+
+      <DiscordPanelPreview
+        title={panel.title}
+        description={panel.description ?? ""}
+        color={PANEL_EMBED_COLOR}
+        buttons={buttons.map((b): PreviewButton => ({ label: b.label, style: STYLE_INT[b.style] ?? 1, emoji: b.emoji }))}
+      />
 
       <div className="button-row" style={{ flexWrap: "wrap" }}>
         {buttons.map(b => (
