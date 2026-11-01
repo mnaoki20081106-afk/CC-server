@@ -76,6 +76,13 @@ const SCHEMA_STATEMENTS = [
     product_json TEXT NOT NULL,
     created_at INTEGER NOT NULL
   )`,
+
+  `CREATE TABLE IF NOT EXISTS bot_guild_cache (
+    guild_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    icon TEXT,
+    seen_at INTEGER NOT NULL
+  )`,
 ];
 
 export async function ensureSchema(env: Env): Promise<void> {
@@ -215,4 +222,27 @@ export async function deleteAvSession(env: Env, id: string): Promise<void> {
 export async function cleanExpiredAvSessions(env: Env): Promise<void> {
   const cutoff = Date.now() - 30 * 60 * 1000;
   await env.DB.prepare("DELETE FROM amazon_vending_sessions WHERE created_at<?").bind(cutoff).run();
+}
+
+// ── bot guild cache ───────────────────────────────────────────────────────────
+// Discord's GET /users/@me/guilds is the only source of truth cc-server's
+// Worker has (no persistent gateway connection), but it can occasionally lag
+// right after an invite. Cache the last good result so a transient failure
+// doesn't empty the dashboard's server list.
+
+export type CachedBotGuild = { id: string; name: string; icon: string | null };
+
+export async function replaceBotGuildCache(env: Env, guilds: CachedBotGuild[]): Promise<void> {
+  const seenAt = Date.now();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM bot_guild_cache"),
+    ...guilds.map(g => env.DB.prepare("INSERT INTO bot_guild_cache(guild_id,name,icon,seen_at) VALUES(?,?,?,?)").bind(g.id, g.name, g.icon, seenAt)),
+  ]);
+}
+
+export async function listBotGuildCache(env: Env, maxAgeMs = 24 * 60 * 60_000): Promise<CachedBotGuild[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT guild_id AS id, name, icon FROM bot_guild_cache WHERE seen_at>=? ORDER BY name COLLATE NOCASE"
+  ).bind(Date.now() - maxAgeMs).all<CachedBotGuild>();
+  return results;
 }

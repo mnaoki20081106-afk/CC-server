@@ -4,6 +4,7 @@ import {
   getGuildConfig, updateGuildConfig,
   listPanels, createPanel, getPanel, updatePanelPost, listPanelButtons, createPanelButton, deletePanelButton, getPanelButton,
   getAvConfig, upsertAvConfig, cleanExpiredAvSessions,
+  replaceBotGuildCache, listBotGuildCache,
 } from "./db";
 import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
 import { sha256Hex, randomToken, corsHeaders, json } from "./utils";
@@ -12,6 +13,19 @@ import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, hand
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
+
+// Invite / applications.commands + manage roles, channels, messages — the
+// permissions cc-server's features actually use.
+const BOT_PERMISSIONS = (
+  1n << 0n |   // CREATE_INSTANT_INVITE
+  1n << 4n |   // MANAGE_CHANNELS
+  1n << 10n |  // VIEW_CHANNEL
+  1n << 11n |  // SEND_MESSAGES
+  1n << 13n |  // MANAGE_MESSAGES
+  1n << 16n |  // READ_MESSAGE_HISTORY
+  1n << 28n |  // MANAGE_ROLES
+  1n << 2n     // BAN_MEMBERS
+).toString();
 
 // ── auth ──────────────────────────────────────────────────────────────────────
 
@@ -140,10 +154,45 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   await sessionFromRequest(request, env);
   await ensureSchema(env);
 
+  // GET /api/status
+  if (path === "/api/status" && method === "GET") {
+    let discordReady = false;
+    let discordError: string | null = null;
+    let guildCount: number | null = null;
+    try {
+      await botJson(env, "/users/@me");
+      discordReady = true;
+      const guilds = await botJson<unknown[]>(env, "/users/@me/guilds");
+      guildCount = guilds.length;
+    } catch (err) {
+      discordError = err instanceof Error ? err.message : String(err);
+    }
+    return json({
+      discordReady,
+      discordError,
+      guildCount,
+      runtime: "cloudflare-workers",
+      inviteUrl: `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_APPLICATION_ID}&permissions=${BOT_PERMISSIONS}&integration_type=0&scope=bot%20applications.commands`,
+    }, { env });
+  }
+
   // GET /api/guilds
   if (path === "/api/guilds" && method === "GET") {
-    const guilds = await botJson<Array<{ id: string; name: string; icon: string | null }>>(env, `/users/@me/guilds`);
-    return json(guilds, { env });
+    try {
+      const guilds = await botJson<Array<{ id: string; name: string; icon: string | null }>>(env, `/users/@me/guilds`);
+      await replaceBotGuildCache(env, guilds).catch(err => console.error("bot guild cache update failed", err));
+      return json(guilds, { env });
+    } catch (err) {
+      // Discord's aggregate guild-list endpoint can lag transiently right
+      // after an invite; fall back to the last known-good snapshot instead
+      // of showing an empty sidebar.
+      const cached = await listBotGuildCache(env).catch(() => []);
+      if (cached.length > 0) {
+        console.warn("bot guild list: live call failed, serving cache", err);
+        return json(cached, { env });
+      }
+      throw err;
+    }
   }
 
   // /api/guilds/:guildId/...

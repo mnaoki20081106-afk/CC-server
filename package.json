@@ -4,6 +4,10 @@
   "description": "CC-Server Discord bot: server management, security, auth, entry/exit, tickets, panels, vending, backup",
   "type": "module",
   "main": "dist/index.js",
+  "workspaces": [
+    "apps/web",
+    "apps/worker"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",

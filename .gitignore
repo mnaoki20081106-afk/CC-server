@@ -4,3 +4,4 @@ dist/
 data/
 *.sqlite
 *.log
+*.tsbuildinfo
