@@ -2,80 +2,85 @@ import type { Env } from "./types";
 
 let schemaReady = false;
 
+// D1's env.DB.exec() splits its input on newlines and runs each line as its
+// own statement, so a multi-line CREATE TABLE breaks mid-statement. Use
+// batch() with one prepare() per statement instead — each is sent whole.
+const SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+
+  `CREATE TABLE IF NOT EXISTS dashboard_sessions (
+    token_hash TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id TEXT PRIMARY KEY,
+    admin_role_id TEXT,
+    mod_role_id TEXT,
+    log_channel_id TEXT,
+    verified_role_id TEXT,
+    verify_channel_id TEXT,
+    welcome_channel_id TEXT,
+    welcome_message TEXT,
+    leave_channel_id TEXT,
+    leave_message TEXT,
+    ticket_category_id TEXT,
+    ticket_log_channel_id TEXT,
+    anti_spam_enabled INTEGER DEFAULT 0,
+    anti_spam_threshold INTEGER DEFAULT 5,
+    anti_spam_window_ms INTEGER DEFAULT 7000,
+    anti_link_enabled INTEGER DEFAULT 0,
+    anti_link_whitelist TEXT DEFAULT '[]',
+    raid_protection_enabled INTEGER DEFAULT 0,
+    raid_join_threshold INTEGER DEFAULT 10,
+    raid_window_ms INTEGER DEFAULT 10000,
+    raid_action TEXT DEFAULT 'lock'
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS panels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    message_id TEXT,
+    channel_id TEXT,
+    created_by TEXT NOT NULL DEFAULT 'admin',
+    created_at INTEGER NOT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS panel_buttons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    panel_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    style TEXT NOT NULL DEFAULT 'Primary',
+    emoji TEXT,
+    action_type TEXT NOT NULL,
+    action_value TEXT NOT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS amazon_vending_config (
+    guild_id TEXT PRIMARY KEY,
+    panel_title TEXT NOT NULL DEFAULT 'Amazon自販機',
+    panel_description TEXT DEFAULT 'Amazon商品をLTCで購入できます。',
+    ltc_address TEXT,
+    api_type TEXT NOT NULL DEFAULT 'rainforest',
+    api_key TEXT
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    asin TEXT NOT NULL,
+    product_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+];
+
 export async function ensureSchema(env: Env): Promise<void> {
   if (schemaReady) return;
-  await env.DB.exec(`
-    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-
-    CREATE TABLE IF NOT EXISTS dashboard_sessions (
-      token_hash TEXT PRIMARY KEY,
-      expires_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS guild_config (
-      guild_id TEXT PRIMARY KEY,
-      admin_role_id TEXT,
-      mod_role_id TEXT,
-      log_channel_id TEXT,
-      verified_role_id TEXT,
-      verify_channel_id TEXT,
-      welcome_channel_id TEXT,
-      welcome_message TEXT,
-      leave_channel_id TEXT,
-      leave_message TEXT,
-      ticket_category_id TEXT,
-      ticket_log_channel_id TEXT,
-      anti_spam_enabled INTEGER DEFAULT 0,
-      anti_spam_threshold INTEGER DEFAULT 5,
-      anti_spam_window_ms INTEGER DEFAULT 7000,
-      anti_link_enabled INTEGER DEFAULT 0,
-      anti_link_whitelist TEXT DEFAULT '[]',
-      raid_protection_enabled INTEGER DEFAULT 0,
-      raid_join_threshold INTEGER DEFAULT 10,
-      raid_window_ms INTEGER DEFAULT 10000,
-      raid_action TEXT DEFAULT 'lock'
-    );
-
-    CREATE TABLE IF NOT EXISTS panels (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      message_id TEXT,
-      channel_id TEXT,
-      created_by TEXT NOT NULL DEFAULT 'admin',
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS panel_buttons (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      panel_id INTEGER NOT NULL,
-      label TEXT NOT NULL,
-      style TEXT NOT NULL DEFAULT 'Primary',
-      emoji TEXT,
-      action_type TEXT NOT NULL,
-      action_value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS amazon_vending_config (
-      guild_id TEXT PRIMARY KEY,
-      panel_title TEXT NOT NULL DEFAULT 'Amazon自販機',
-      panel_description TEXT DEFAULT 'Amazon商品をLTCで購入できます。',
-      ltc_address TEXT,
-      api_type TEXT NOT NULL DEFAULT 'rainforest',
-      api_key TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
-      id TEXT PRIMARY KEY,
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      asin TEXT NOT NULL,
-      product_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-  `);
+  await env.DB.batch(SCHEMA_STATEMENTS.map(sql => env.DB.prepare(sql)));
   schemaReady = true;
 }
 
