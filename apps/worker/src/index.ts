@@ -56,7 +56,7 @@ async function processInteraction(interaction: any, env: Env, ctx: ExecutionCont
 
   // Amazon自販機 select: av:select:<sessionId>
   if (type === 3 && customId.startsWith("av:select:")) {
-    return handleAvSelect(interaction, env);
+    return handleAvSelect(interaction);
   }
 
   // Amazon自販機 next button: av:next:<sessionId>
@@ -347,7 +347,7 @@ export default {
     }
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(Promise.all([
       ensureSchema(env).then(() => cleanExpiredSessions(env)).catch(console.error),
       ensureSchema(env).then(() => cleanExpiredAvSessions(env)).catch(console.error),

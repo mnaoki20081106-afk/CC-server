@@ -385,7 +385,7 @@ export function handleAvNext(interaction: any): Response {
 }
 
 // Called when user selects a variant — returns address modal directly
-export async function handleAvSelect(interaction: any, env: Env): Promise<Response> {
+export async function handleAvSelect(interaction: any): Promise<Response> {
   const value = String(interaction.data?.values?.[0] ?? "");
   const parts = value.split(":");
   if (parts.length < 3) return interactionResponse(ephemeral("選択値が不正です。"));
