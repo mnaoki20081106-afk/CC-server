@@ -536,3 +536,187 @@ textarea { min-height: 92px; resize: vertical; }
 .discord-action.style-3 { background: #248046; }
 .discord-action.style-4 { background: #da373c; }
 @media (max-width: 600px) { .discord-panel-preview { padding: 12px; } .discord-panel-embed { width: 100%; } }
+
+/* ── live server editor (channel tree + permission preview) ─────────────── */
+/* Ported from xaccount-bot's styles.css — the "LIVE SERVER EDITOR" view. */
+
+.server-editor-card { margin-bottom: 14px; padding: 24px; overflow: hidden; }
+.server-editor-heading { align-items: center; }
+.editor-add-category { white-space: nowrap; }
+.editor-heading-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+
+.permission-preview-controls { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.permission-preview-role-select { min-height: 34px; display: inline-flex; align-items: center; gap: 6px; padding: 3px 5px 3px 9px; border: 1px solid #263149; border-radius: 10px; color: #7888a5; background: #11192a; font-size: 9px; font-weight: 800; }
+.permission-preview-role-select > span { flex: 0 0 auto; }
+.permission-preview-role-select select { width: auto; min-width: 112px; max-width: 180px; height: 27px; padding: 0 24px 0 7px; border: 0; border-radius: 7px; color: #dce4f5; background-color: #182238; font-size: 9px; font-weight: 800; }
+.permission-preview-toggle { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 10px; border: 1px solid #263149; border-radius: 10px; color: #8f9db8; background: #11192a; font-size: 10px; font-weight: 800; cursor: pointer; user-select: none; }
+.permission-preview-toggle input { width: 14px; height: 14px; margin: 0; accent-color: #6473f6; }
+
+.server-editor-layout { display: grid; grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr); min-height: 500px; border: 1px solid #202a3f; border-radius: 18px; overflow: hidden; background: #0a0e17; }
+.discord-preview { position: relative; min-width: 0; background: #2b2d31; border-right: 1px solid rgba(255, 255, 255, 0.06); }
+.discord-preview-server { height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; color: #f2f3f5; background: #2b2d31; border-bottom: 1px solid #1f2023; box-shadow: 0 1px 0 rgba(0, 0, 0, .25); }
+.discord-preview-server strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.discord-preview-server.touch-drop-target { background: #35394a; box-shadow: inset 0 -2px 0 #7280ff; }
+
+.permission-preview-context { min-height: 32px; display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid #232428; color: #949ba4; background: #25272b; font-size: 9px; font-weight: 700; }
+.permission-preview-context-icon { color: #7d89ff; font-size: 9px; }
+.permission-preview-context strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d7dbff; font-size: 9px; font-weight: 900; }
+
+.bulk-selection-bar { min-height: 46px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px 7px 11px; border-bottom: 1px solid #303654; color: #dfe2ff; background: linear-gradient(90deg, rgba(88,101,242,.24), rgba(88,101,242,.10)), #272a31; }
+.bulk-selection-bar > div { min-width: 0; }
+.bulk-selection-bar strong, .bulk-selection-bar span { display: block; }
+.bulk-selection-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.bulk-selection-bar span { margin-top: 2px; color: #a6add8; font-size: 8px; }
+.bulk-selection-bar button { min-height: 28px; padding: 0 9px; flex: 0 0 auto; border: 1px solid #6570d7; border-radius: 7px; color: #f3f4ff; background: #4b56b8; font-size: 9px; font-weight: 900; cursor: pointer; }
+
+.discord-plus { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 auto; padding: 0; border-radius: 8px; color: #b5bac1; background: transparent; font-size: 20px; line-height: 1; cursor: pointer; transition: .15s ease; }
+.discord-plus:hover { color: #fff; background: #3f4147; }
+
+.discord-channel-scroll { min-height: 440px; max-height: 580px; padding: 14px 8px 18px; overflow: auto; }
+.discord-channel-group { margin-bottom: 14px; }
+.uncategorized-group { margin-bottom: 10px; }
+.discord-category { height: 28px; display: flex; align-items: center; gap: 4px; padding: 0 2px 0 0; border-radius: 6px; }
+.discord-category.selected { background: rgba(255, 255, 255, .045); }
+.discord-category-name { min-width: 0; flex: 1; display: flex; align-items: center; gap: 3px; padding: 4px 3px; color: #949ba4; background: transparent; text-align: left; cursor: pointer; }
+.discord-category-name:hover { color: #dbdee1; }
+.discord-category-name span { font-size: 11px; }
+.discord-category-name strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; letter-spacing: .02em; }
+.category-plus { width: 26px; height: 26px; font-size: 17px; }
+
+.discord-channel { position: relative; width: 100%; height: 34px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto 20px; align-items: center; gap: 3px; margin: 1px 0; padding: 0 8px; border-radius: 6px; color: #949ba4; background: transparent; text-align: left; cursor: pointer; -webkit-touch-callout: none; transition: .12s ease; }
+.discord-channel:hover { color: #dbdee1; background: #35373c; }
+.discord-channel.long-pressing { color: #eef1ff; background: #393c46; transform: scale(.992); box-shadow: inset 0 0 0 1px rgba(117, 131, 255, .35); }
+.discord-channel.touch-dragging { opacity: .16; background: #41444d; box-shadow: inset 0 0 0 1px rgba(114, 128, 255, .22); }
+.discord-channel.dragging, .discord-category.dragging { opacity: .45; }
+.discord-channel[draggable="true"], .discord-category[draggable="true"] { user-select: none; }
+.discord-channel.selected { color: #f2f3f5; background: #404249; }
+.discord-channel.bulk-mode:not(.bulk-selected) { opacity: .62; }
+.discord-channel.bulk-selected { color: #f3f4ff; background: linear-gradient(90deg, rgba(88,101,242,.36), rgba(88,101,242,.16)); box-shadow: inset 3px 0 0 #7c87ff, inset 0 0 0 1px rgba(124,135,255,.32); }
+.discord-channel.bulk-selected:hover { background: linear-gradient(90deg, rgba(88,101,242,.44), rgba(88,101,242,.22)); }
+
+.touch-channel-ghost { position: fixed; left: 0; top: 0; z-index: 10000; display: grid; grid-template-columns: 24px minmax(0, 1fr) 24px; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid rgba(135, 146, 255, .72); border-radius: 8px; color: #f3f5ff; background: rgba(64, 66, 78, .97); box-shadow: 0 16px 38px rgba(0, 0, 0, .42), 0 4px 12px rgba(0, 0, 0, .3), 0 0 0 1px rgba(114, 128, 255, .16); pointer-events: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; will-change: transform; transform-origin: center; animation: touch-channel-lift .13s ease-out; }
+.touch-channel-ghost .channel-hash { font-size: 20px; }
+.touch-channel-ghost .channel-name { color: #fff; font-size: 14px; font-weight: 700; }
+.touch-ghost-grip { justify-self: end; color: #b7beff; font-size: 14px; font-weight: 900; letter-spacing: -2px; }
+@keyframes touch-channel-lift { from { opacity: .7; filter: brightness(.9); } to { opacity: 1; filter: brightness(1); } }
+
+.discord-channel.touch-drop-before { background: linear-gradient(to bottom, rgba(114,128,255,.2), transparent 55%); box-shadow: inset 0 4px 0 #8b96ff; }
+.discord-channel.touch-drop-after { background: linear-gradient(to top, rgba(114,128,255,.2), transparent 55%); box-shadow: inset 0 -4px 0 #8b96ff; }
+.discord-channel.touch-drop-before::before, .discord-channel.touch-drop-after::after { content: ""; position: absolute; left: 3px; width: 7px; height: 7px; border-radius: 50%; background: #7280ff; pointer-events: none; }
+.discord-channel.touch-drop-before::before { top: -2px; }
+.discord-channel.touch-drop-after::after { bottom: -2px; }
+.discord-channel-group.touch-category-target > .discord-category { color: #eef1ff; background: rgba(88, 101, 242, .17); box-shadow: inset 0 0 0 1px rgba(114, 128, 255, .48); }
+
+.uncategorized-touch-drop { display: grid; place-items: center; min-height: 38px; margin: 0 2px 10px; border: 1px dashed #46506c; border-radius: 8px; color: #818da6; background: rgba(18, 25, 41, .62); font-size: 9px; font-weight: 800; letter-spacing: .04em; transition: .12s ease; }
+.uncategorized-touch-drop.active { color: #dfe4ff; border-color: #7280ff; background: rgba(88, 101, 242, .18); }
+
+.reorder-status { position: absolute; z-index: 9000; top: 66px; left: 50%; width: calc(100% - 24px); max-width: 360px; min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 8px 11px; border: 1px solid #5361bd; border-radius: 10px; color: #e8ebff; background: rgba(24, 29, 48, .96); box-shadow: 0 8px 24px rgba(0,0,0,.35); transform: translateX(-50%); pointer-events: none; backdrop-filter: blur(10px); }
+.reorder-status.dragging { border-color: #7784ff; background: rgba(42, 47, 78, .97); }
+.reorder-status.saving { border-color: #5a6680; color: #c8d1e4; }
+.reorder-status.success { border-color: #34704d; color: #a9ebc1; background: rgba(16, 49, 31, .97); }
+.reorder-status.error { border-color: #813943; color: #f1abb3; background: rgba(55, 20, 25, .97); }
+.reorder-status-icon { width: 22px; height: 22px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: inherit; background: rgba(255,255,255,.08); font-size: 13px; font-weight: 900; }
+.reorder-status strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 900; }
+
+body.cc-touch-reordering { overflow: hidden; overscroll-behavior: none; }
+body.cc-touch-reordering .discord-channel, body.cc-touch-reordering .discord-category { user-select: none; -webkit-user-select: none; }
+
+.bulk-select-indicator { width: 18px; height: 18px; display: grid; place-items: center; justify-self: end; border: 1px solid #596174; border-radius: 50%; color: #7d8698; background: #2b2d31; font-size: 9px; font-weight: 900; }
+.bulk-select-indicator.selected { border-color: #8791ff; color: #fff; background: #5865f2; box-shadow: 0 0 0 2px rgba(88,101,242,.16); }
+
+.channel-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 600; }
+.permission-badge { max-width: 150px; justify-self: end; display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 999px; font-size: 8px; font-weight: 900; letter-spacing: .01em; white-space: nowrap; overflow: hidden; }
+.permission-badge-role { max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .78; }
+.permission-badge-state { flex: 0 0 auto; }
+.permission-badge.allow { color: #9de6ba; background: rgba(48, 166, 95, .14); }
+.permission-badge.deny { color: #f2a0aa; background: rgba(201, 71, 87, .14); }
+.permission-badge.inherit { color: #9aa3b2; background: rgba(154, 163, 178, .10); }
+.channel-hash { color: #80848e; font-size: 21px; font-weight: 400; }
+.channel-edit { grid-column: -1; opacity: 0; color: #b5bac1; font-size: 18px; transform: translateX(-2px); transition: .12s ease; }
+.discord-channel:hover .channel-edit, .discord-channel.selected .channel-edit { opacity: 1; transform: translateX(0); }
+
+.discord-empty { display: grid; place-items: center; gap: 12px; min-height: 260px; padding: 28px; color: #949ba4; text-align: center; font-size: 12px; }
+.discord-empty button { padding: 8px 11px; color: #fff; background: #5865f2; border-radius: 8px; cursor: pointer; }
+
+.server-editor-inspector { min-width: 0; padding: 24px; background: radial-gradient(circle at 100% 0%, rgba(88, 101, 242, .08), transparent 22rem), #0d1320; }
+.editor-welcome { min-height: 100%; display: grid; align-content: center; justify-items: start; max-width: 500px; margin: 0 auto; }
+.editor-welcome-icon { width: 52px; height: 52px; display: grid; place-items: center; border: 1px solid #344061; border-radius: 16px; color: #a7b1ff; background: #151e34; font-size: 25px; font-weight: 500; }
+.editor-welcome h3 { margin: 16px 0 8px; font-size: 21px; }
+.editor-welcome p { margin: 0; color: #7f8ca6; font-size: 12px; line-height: 1.7; }
+.editor-quick-actions, .editor-action-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.editor-form { max-width: 560px; margin: 0 auto; }
+.editor-inspector-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.editor-inspector-title h3 { margin: 5px 0 0; font-size: 21px; }
+.editor-close { width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 1px solid #29334a; border-radius: 9px; color: #7f8ca7; background: #101827; cursor: pointer; font-size: 18px; }
+.editor-close:hover { color: #fff; border-color: #425071; }
+.editor-form > label { display: block; margin-bottom: 16px; }
+.editor-form > label > span { display: block; margin-bottom: 7px; color: #8b99b5; font-size: 10px; font-weight: 800; letter-spacing: .05em; }
+.editor-save { width: 100%; margin-top: 4px; }
+
+.bulk-permission-editor { max-width: 620px; margin: 0 auto; }
+.bulk-permission-editor .editor-inspector-title p { max-width: 480px; margin: 6px 0 0; color: #75839d; font-size: 9px; line-height: 1.5; }
+.bulk-selected-channels { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.bulk-selected-channels button { min-width: 0; max-width: 190px; display: inline-grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid #39446b; border-radius: 999px; color: #dce1ff; background: #151d35; cursor: pointer; }
+.bulk-selected-channels button > span { color: #8f99ff; font-size: 10px; }
+.bulk-selected-channels button > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+.bulk-selected-channels button > i { color: #7d89a5; font-size: 9px; font-style: normal; }
+.bulk-channel-permission-editor { margin-top: 0; border-color: #35416a; background: radial-gradient(circle at 100% 0%, rgba(88,101,242,.09), transparent 18rem), #0a1120; }
+.bulk-permission-note { margin: 0 0 13px; padding: 9px 10px; border: 1px solid #2a3553; border-radius: 9px; color: #75839d; background: #0d1627; font-size: 8px; line-height: 1.5; }
+.bulk-permission-note strong { color: #b4bdd2; }
+.bulk-permission-modes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.permission-modes button.active.keep { color: #d4d9e4; border-color: #596376; background: #303746; }
+.bulk-permission-save { width: 100%; margin-top: 14px; }
+.bulk-apply-log { margin-top: 10px; padding: 10px 11px; border: 1px solid #2a3553; border-radius: 10px; color: #8e9bb5; background: #0d1627; }
+.bulk-apply-log-title { display: flex; align-items: center; gap: 8px; }
+.bulk-apply-log-title > span { width: 20px; height: 20px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 6px; background: rgba(255,255,255,.06); font-size: 10px; font-weight: 900; }
+.bulk-apply-log-title strong { color: inherit; font-size: 10px; font-weight: 900; }
+.bulk-apply-log small { display: block; margin-top: 5px; padding-left: 28px; color: #71809b; font-size: 8px; line-height: 1.55; overflow-wrap: anywhere; }
+.bulk-apply-log.saving { border-color: #4f5d88; color: #c6ceee; background: #111a31; }
+.bulk-apply-log.success { border-color: #2f6847; color: #a4e6bd; background: #0e2519; }
+.bulk-apply-log.success small { color: #74b88d; }
+.bulk-apply-log.error { border-color: #7c3540; color: #f0a5ae; background: #2b1217; }
+.bulk-apply-log.error small { color: #ca7c86; }
+
+.channel-permission-editor { margin: 20px 0 4px; padding: 16px; border: 1px solid #263149; border-radius: 14px; background: #0a1120; }
+.permission-editor-head { margin-bottom: 14px; }
+.permission-editor-head strong, .permission-editor-head small { display: block; }
+.permission-editor-head strong { color: #dce5f8; font-size: 12px; }
+.permission-editor-head small { margin-top: 4px; color: #66758f; font-size: 9px; }
+.channel-permission-editor > label { display: block; margin-bottom: 14px; }
+.channel-permission-editor > label > span { display: block; margin-bottom: 7px; color: #8b99b5; font-size: 10px; font-weight: 800; }
+.permission-list { display: grid; gap: 7px; }
+.permission-row { display: grid; grid-template-columns: minmax(110px, 1fr) auto; align-items: center; gap: 12px; min-height: 42px; padding: 7px 8px 7px 11px; border: 1px solid #1d2840; border-radius: 10px; background: #0e1727; }
+.permission-row > span { color: #bac6dc; font-size: 10px; font-weight: 800; }
+.permission-modes { display: grid; grid-template-columns: repeat(3, 52px); gap: 4px; }
+.permission-modes button { min-height: 28px; padding: 0 7px; border: 1px solid #27344d; border-radius: 8px; color: #6f7e99; background: #111a2b; font-size: 9px; font-weight: 900; cursor: pointer; }
+.permission-modes button:hover { color: #d9e2f5; border-color: #3d4c6e; }
+.permission-modes button.active.inherit { color: #d1d8e6; border-color: #5b6678; background: #242c3a; }
+.permission-modes button.active.allow { color: #a5ebbf; border-color: #2c7148; background: #12301f; }
+.permission-modes button.active.deny { color: #f2a2ac; border-color: #71313b; background: #35161b; }
+.permission-save { width: 100%; margin-top: 12px; }
+.permission-advanced { margin-top: 10px; }
+.permission-advanced summary { cursor: pointer; padding: 8px 10px; border: 1px solid #1d2840; border-radius: 10px; background: #0e1727; list-style: none; }
+.permission-advanced summary::-webkit-details-marker { display: none; }
+.permission-advanced summary span { color: #bac6dc; font-size: 10px; font-weight: 800; margin-right: 8px; }
+.permission-advanced summary small { color: #66758f; font-size: 9px; }
+.permission-advanced .permission-list { margin-top: 8px; }
+
+@media (max-width: 900px) {
+  .server-editor-layout { grid-template-columns: 1fr; }
+  .discord-preview { border-right: 0; border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+  .discord-channel-scroll { min-height: 320px; max-height: 430px; }
+  .server-editor-inspector { min-height: 390px; }
+  .editor-heading-actions { width: 100%; justify-content: stretch; }
+  .permission-preview-controls { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr); }
+  .permission-preview-toggle { justify-content: center; }
+  .permission-preview-role-select { width: 100%; min-width: 0; }
+  .permission-preview-role-select select { width: 100%; min-width: 0; max-width: none; }
+  .editor-heading-actions .editor-add-category { width: 100%; justify-content: center; }
+  .permission-badge { max-width: 118px; gap: 3px; padding-inline: 5px; }
+  .permission-badge-role { max-width: 52px; }
+  .permission-row { grid-template-columns: 1fr; }
+  .permission-modes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .bulk-permission-modes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bulk-selection-bar { position: sticky; top: 0; z-index: 5; }
+  .bulk-selected-channels button { max-width: calc(50% - 3px); }
+}
