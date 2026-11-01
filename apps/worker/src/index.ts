@@ -19,7 +19,7 @@ import {
   patchChannelPermission, bulkChannelPermissions,
 } from "./server-editor";
 import {
-  createBackup, listBackups, deleteBackup, previewRestore, startRestore, listRestoreJobs, getRestoreJobPublic,
+  createBackup, listBackups, deleteBackup, previewRestore, startRestore, listRestoreJobs, getRestoreJobPublic, cancelRestore,
 } from "./backup";
 import {
   getMemberActivitySettings, saveMemberActivitySettings, primeMemberActivity, sendMemberActivityTest,
@@ -249,6 +249,13 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
   const jobMatch = path.match(/^\/api\/restore-jobs\/([^/]+)$/);
   if (jobMatch && method === "GET") {
     return json(await getRestoreJobPublic(env, jobMatch[1]!), { env });
+  }
+
+  // DELETE /api/restore-jobs/:id — cancel a running restore job
+  if (jobMatch && method === "DELETE") {
+    const cancelled = await cancelRestore(env, jobMatch[1]!);
+    if (!cancelled) throw new HttpError(409, "このジョブは既に完了または停止しています");
+    return json({ ok: true }, { env });
   }
 
   // /api/guilds/:guildId/...

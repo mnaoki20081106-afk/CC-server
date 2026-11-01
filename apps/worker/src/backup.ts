@@ -3,7 +3,7 @@ import { botJson, DiscordApiError, type DiscordPermissionOverwrite } from "./dis
 import { HttpError } from "./utils";
 import {
   createBackupRecord, listBackupRecords, getBackupRecord, deleteBackupRecord,
-  createRestoreJob, getRestoreJob, listRestoreJobsForGuild, updateRestoreJob,
+  createRestoreJob, getRestoreJob, listRestoreJobsForGuild, updateRestoreJob, cancelRestoreJob,
   type BackupRow, type RestoreJobRow,
 } from "./backup-db";
 
@@ -284,10 +284,21 @@ export async function listRestoreJobs(env: Env, targetGuildId: string) {
   return listRestoreJobsForGuild(env, targetGuildId);
 }
 
+export async function cancelRestore(env: Env, jobId: string): Promise<boolean> {
+  return cancelRestoreJob(env, jobId);
+}
+
 export async function getRestoreJobPublic(env: Env, id: string) {
   const row = await getRestoreJob(env, id);
   if (!row) throw new HttpError(404, "リストアジョブが見つかりません");
   return row;
+}
+
+// Restore has no way to abort an in-flight Discord API call, so cancellation
+// is checked between phases and takes effect at the next boundary.
+async function isCancelled(env: Env, jobId: string): Promise<boolean> {
+  const current = await getRestoreJob(env, jobId);
+  return current?.status === "cancelled";
 }
 
 async function runRestore(env: Env, jobId: string): Promise<void> {
@@ -316,6 +327,8 @@ async function runRestore(env: Env, jobId: string): Promise<void> {
   }
   roleMap[snapshot.sourceGuild.id] = job.target_guild_id;
 
+  if (await isCancelled(env, jobId)) { await updateRestoreJob(env, jobId, { result_json: JSON.stringify(stats) }); return; }
+
   // channels (categories first, so parent_id can be remapped)
   const targetChannels = await botJson<any[]>(env, `/guilds/${job.target_guild_id}/channels`);
   const orderedChannels = [...snapshot.channels].sort((a, b) => (a.type === 4 ? 0 : 1) - (b.type === 4 ? 0 : 1) || a.position - b.position);
@@ -343,6 +356,8 @@ async function runRestore(env: Env, jobId: string): Promise<void> {
     channelMap[source.id] = String(target.id);
   }
 
+  if (await isCancelled(env, jobId)) { await updateRestoreJob(env, jobId, { result_json: JSON.stringify(stats) }); return; }
+
   // positions (best-effort, ignore failures)
   try {
     const positions = orderedChannels.filter(c => channelMap[c.id]).map(c => ({ id: channelMap[c.id], position: c.position }));
@@ -366,6 +381,8 @@ async function runRestore(env: Env, jobId: string): Promise<void> {
     stats.warnings.push("サーバー全体の設定（認証レベル等）を復元できませんでした。");
   }
 
+  if (await isCancelled(env, jobId)) { await updateRestoreJob(env, jobId, { result_json: JSON.stringify(stats) }); return; }
+
   // bans
   for (const ban of snapshot.bans) {
     try {
@@ -378,6 +395,8 @@ async function runRestore(env: Env, jobId: string): Promise<void> {
       stats.warnings.push(`BAN復元に失敗したユーザーがいます: ${ban.username}`);
     }
   }
+
+  if (await isCancelled(env, jobId)) { await updateRestoreJob(env, jobId, { result_json: JSON.stringify(stats) }); return; }
 
   // members currently present: restore roles / nickname / timeout
   for (const member of snapshot.members) {
@@ -398,5 +417,6 @@ async function runRestore(env: Env, jobId: string): Promise<void> {
     }
   }
 
+  if (await isCancelled(env, jobId)) { await updateRestoreJob(env, jobId, { result_json: JSON.stringify(stats) }); return; }
   await updateRestoreJob(env, jobId, { status: "completed", result_json: JSON.stringify(stats) });
 }

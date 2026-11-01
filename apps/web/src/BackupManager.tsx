@@ -31,7 +31,7 @@ type RestoreJob = {
   id: string;
   backup_id: string;
   target_guild_id: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   result_json: string;
   error: string | null;
   created_at: number;
@@ -90,10 +90,25 @@ export default function BackupManager({ guildId, onNotice, onError }: { guildId:
     }
   }
 
-  async function deleteBackup(id: string) {
-    setBusy(id);
+  async function deleteBackup(backup: Backup) {
+    if (!window.confirm(`「${backup.label || backup.sourceGuildName}」のバックアップを削除します。復元できなくなります。よろしいですか？`)) return;
+    setBusy(backup.id);
     try {
-      await api(`/api/backups/${id}`, { method: "DELETE" });
+      await api(`/api/backups/${backup.id}`, { method: "DELETE" });
+      onNotice("バックアップを削除しました");
+      await load();
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelJob(job: RestoreJob) {
+    setBusy(job.id);
+    try {
+      await api(`/api/restore-jobs/${job.id}`, { method: "DELETE" });
+      onNotice("復元ジョブを停止しました");
       await load();
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : String(reason));
@@ -135,10 +150,13 @@ export default function BackupManager({ guildId, onNotice, onError }: { guildId:
       <div className="card" style={{ padding: 24 }}>
         <div className="section-head">
           <div>
-            <span className="eyebrow">BACKUP</span>
+            <span className="eyebrow">DISASTER RECOVERY</span>
             <h2>バックアップ</h2>
             <p className="muted">ロール・チャンネル・権限・メンバーのロール/ニックネーム・BAN一覧・サーバー設定を保存します。</p>
           </div>
+          <button type="button" className="secondary" onClick={() => void load()} disabled={busy !== null}>
+            再読み込み
+          </button>
         </div>
         <div className="form-grid two">
           <Field label="ラベル（任意）">
@@ -153,6 +171,23 @@ export default function BackupManager({ guildId, onNotice, onError }: { guildId:
       </div>
 
       <div className="card" style={{ padding: 24 }}>
+        <div className="section-head">
+          <h3>復元できる範囲とDiscord側の制約</h3>
+        </div>
+        <p className="muted">
+          復元対象: サーバー基本設定、@everyoneを含むロール権限、カテゴリ/チャンネル配置と権限、
+          メンバーID・ロール・ニックネーム・有効なタイムアウト、BAN一覧、Welcome Screen。
+          既存のロール・チャンネルは削除せず、一致するものを再利用して不足分だけ追加します。
+        </p>
+        <p className="muted">
+          Discord API上、そのまま復元できないもの: 過去メッセージを元の投稿者・元のMessage IDのまま戻すこと、
+          外部Integrationや他社Botを本人/提供元の再認証なしで再導入すること、Server Boost・所有権・監査ログ・
+          元の招待コードをそのまま再現すること。退出済みメンバーの再招待もサポートしていません
+          （現在サーバーに残っているメンバーのみ、ロール・ニックネーム・タイムアウトを復元します）。
+        </p>
+      </div>
+
+      <div className="card" style={{ padding: 24 }}>
         <h2>バックアップ一覧</h2>
         {backups.length === 0 && <p className="muted">まだバックアップがありません。</p>}
         <div className="stack">
@@ -162,14 +197,19 @@ export default function BackupManager({ guildId, onNotice, onError }: { guildId:
                 <strong>{backup.label || backup.sourceGuildName}</strong>
                 <small>
                   {formatDate(backup.createdAt)} · ロール{backup.roleCount} · チャンネル{backup.channelCount} · メンバー{backup.memberCount}
-                  {backup.warnings.length > 0 && ` · 警告${backup.warnings.length}件`}
                 </small>
+                {backup.warnings.length > 0 && (
+                  <details>
+                    <summary>取得時の注意 {backup.warnings.length}件</summary>
+                    <ul>{backup.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+                  </details>
+                )}
               </span>
               <div className="button-row" style={{ marginTop: 0 }}>
                 <button type="button" className="secondary" onClick={() => void openPreview(backup)} disabled={busy === backup.id}>
                   このサーバーへ復元
                 </button>
-                <button type="button" className="danger" onClick={() => void deleteBackup(backup.id)} disabled={busy === backup.id}>
+                <button type="button" className="danger" onClick={() => void deleteBackup(backup)} disabled={busy === backup.id}>
                   削除
                 </button>
               </div>
@@ -188,13 +228,26 @@ export default function BackupManager({ guildId, onNotice, onError }: { guildId:
               <div key={job.id} className="toggle-row">
                 <span className="toggle-copy">
                   <strong>
-                    {job.status === "running" ? "実行中..." : job.status === "completed" ? "完了" : "失敗"}
+                    {job.status === "running" ? "実行中..." : job.status === "completed" ? "完了" : job.status === "cancelled" ? "停止済み" : "失敗"}
                   </strong>
                   <small>
                     {formatDate(job.created_at)}
                     {stats && ` · ロール作成${stats.rolesCreated}/更新${stats.rolesUpdated} · チャンネル作成${stats.channelsCreated}/更新${stats.channelsUpdated} · メンバー復元${stats.membersUpdated}（未在籍${stats.membersNotPresent}） · BAN${stats.bansRestored}`}
                     {job.error && ` · エラー: ${job.error}`}
                   </small>
+                  {stats && stats.warnings.length > 0 && (
+                    <details>
+                      <summary>注意 {stats.warnings.length}件</summary>
+                      <ul>{stats.warnings.slice(-8).map((w, i) => <li key={i}>{w}</li>)}</ul>
+                    </details>
+                  )}
+                  {job.status === "running" && (
+                    <div className="button-row" style={{ marginTop: 6 }}>
+                      <button type="button" className="danger" onClick={() => void cancelJob(job)} disabled={busy !== null}>
+                        復元を停止
+                      </button>
+                    </div>
+                  )}
                 </span>
                 <span className={`status-pill ${job.status === "completed" ? "good" : job.status === "failed" ? "bad" : ""}`}>
                   <i /> {job.status}

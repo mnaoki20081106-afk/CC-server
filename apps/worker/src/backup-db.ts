@@ -81,7 +81,7 @@ export type RestoreJobRow = {
   id: string;
   backup_id: string;
   target_guild_id: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   result_json: string;
   error: string | null;
   created_at: number;
@@ -115,4 +115,15 @@ export async function updateRestoreJob(env: Env, id: string, patch: Partial<Pick
   const set = [...keys.map(k => `${k}=?`), "updated_at=?"].join(",");
   const vals = [...keys.map(k => (patch as any)[k]), Date.now()];
   await env.DB.prepare(`UPDATE guild_restore_jobs SET ${set} WHERE id=?`).bind(...vals, id).run();
+}
+
+// Marks a still-running job as cancelled. runRestore() polls this status
+// between phases and stops early once it sees it — there is no way to abort
+// an in-flight Discord API call, so cancellation takes effect at the next
+// phase boundary (role/channel/position/extras/bans/members), not instantly.
+export async function cancelRestoreJob(env: Env, id: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE guild_restore_jobs SET status='cancelled', updated_at=? WHERE id=? AND status='running'`
+  ).bind(Date.now(), id).run();
+  return (result.meta.changes ?? 0) > 0;
 }
