@@ -9,13 +9,13 @@ let currentConfig = null;
 
 // ── storage ──────────────────────────────────────────────────────────────────
 function loadToken() {
-  try { return sessionStorage.getItem('cc_token'); } catch { return null; }
+  try { return localStorage.getItem('cc_token'); } catch { return null; }
 }
 function saveToken(t) {
-  try { sessionStorage.setItem('cc_token', t); } catch {}
+  try { localStorage.setItem('cc_token', t); } catch {}
 }
 function clearToken() {
-  try { sessionStorage.removeItem('cc_token'); } catch {}
+  try { localStorage.removeItem('cc_token'); } catch {}
 }
 
 // ── fetch helpers ─────────────────────────────────────────────────────────────
