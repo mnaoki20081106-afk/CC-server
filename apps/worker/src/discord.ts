@@ -48,7 +48,11 @@ export async function botJson<T>(env: Env, path: string, init: RequestInit = {})
     const detail = await res.text().catch(() => "");
     throw new DiscordApiError(res.status, `Discord API ${res.status}: ${detail.slice(0, 300)}`);
   }
-  return res.json() as Promise<T>;
+  // Several Discord endpoints (e.g. the bulk channel-position PATCH) return
+  // 204 No Content on success — res.json() throws on an empty body.
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export interface DiscordPermissionOverwrite {
