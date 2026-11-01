@@ -15,7 +15,7 @@ import {
   ensureSecurityGatewayRunning, runSecurityScheduled,
 } from "./security/service";
 import {
-  getServerEditorData, createChannel, reorderChannel, createRole, patchRole, deleteRole,
+  getServerEditorData, createChannel, patchChannel, reorderChannel, createRole, patchRole, deleteRole,
   patchChannelPermission, bulkChannelPermissions,
 } from "./server-editor";
 import {
@@ -332,6 +332,14 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
   if (sub === "/channels/permissions/bulk" && method === "PATCH") {
     const body = await request.json() as Parameters<typeof bulkChannelPermissions>[2];
     return json(await bulkChannelPermissions(env, guildId, body), { env });
+  }
+
+  // PATCH /api/guilds/:id/channels/:channelId
+  const channelMatch = sub.match(/^\/channels\/(\d+)$/);
+  if (channelMatch && method === "PATCH") {
+    const [, channelId] = channelMatch as [string, string];
+    const body = await request.json() as { name?: string; parentId?: string | null; topic?: string };
+    return json(await patchChannel(env, guildId, channelId, body), { env });
   }
 
   // PATCH /api/guilds/:id/channels/:channelId/permissions/:targetId

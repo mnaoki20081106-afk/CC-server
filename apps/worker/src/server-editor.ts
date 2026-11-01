@@ -238,6 +238,20 @@ export async function createChannel(env: Env, guildId: string, input: { name?: s
   return { id: created.id, name: created.name, type: input.type ?? "text" };
 }
 
+export async function patchChannel(env: Env, _guildId: string, channelId: string, input: { name?: string; parentId?: string | null; topic?: string }): Promise<{ id: string; name: string }> {
+  const body: Record<string, unknown> = {};
+  if (input.name !== undefined) {
+    const name = input.name.trim();
+    if (!name || name.length > 100) throw new HttpError(400, "チャンネル名が不正です");
+    body.name = name;
+  }
+  if (input.parentId !== undefined) body.parent_id = input.parentId || null;
+  if (input.topic !== undefined) body.topic = input.topic;
+  if (Object.keys(body).length === 0) throw new HttpError(400, "更新する項目がありません");
+  const updated = await botJson<DiscordChannel>(env, `/channels/${channelId}`, { method: "PATCH", body: JSON.stringify(body) });
+  return { id: updated.id, name: updated.name };
+}
+
 export async function reorderChannel(env: Env, guildId: string, input: { id?: string; targetId?: string | null; placement?: "before" | "after" | "start"; parentId?: string | null; position?: number }): Promise<Record<string, unknown>> {
   if (!/^\d+$/.test(input.id ?? "")) throw new HttpError(400, "並び替え対象が不正です");
   const channels = await botJson<DiscordChannel[]>(env, `/guilds/${guildId}/channels`);
