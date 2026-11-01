@@ -1,10 +1,8 @@
 // Ported from xaccount-bot's apps/worker/src/security/gateway.ts.
-// The member-activity hooks (handleMemberActivityGatewayEvent,
-// recoverMemberActivityAfterFreshSession) are dropped — that's a separate
-// xaccount-bot feature with no analog in cc-server.
 import type { AuditEntry, DiscordMemberAddEvent, DiscordMessageEvent, GatewayStatus } from "./types";
 import type { Env } from "../types";
 import { SecurityEngine } from "./engine";
+import { handleMemberActivityGatewayEvent, recoverMemberActivityAfterFreshSession, type GatewayMemberActivityEvent } from "../member-activity";
 
 type StoredGatewayState = GatewayStatus & {
   sequence: number | null;
@@ -357,6 +355,9 @@ export class DiscordSecurityGateway {
       for (const guildId of stored.guildIds) {
         this.enqueueSecurityEvent("audit:" + guildId, "initial audit reconcile failed " + guildId, () => this.engine.reconcileGuild(guildId));
       }
+      recoverMemberActivityAfterFreshSession(this.env).catch(error => {
+        console.error("member activity fresh-session recovery failed", error);
+      });
       return;
     }
     if (payload.t === "RESUMED") {
@@ -392,6 +393,13 @@ export class DiscordSecurityGateway {
     if (payload.t === "GUILD_MEMBER_ADD") {
       const event = payload.d as DiscordMemberAddEvent;
       this.enqueueSecurityEvent("member:" + event.guild_id, "security member event failed", () => this.engine.handleJoin(event));
+      const activityEvent = payload.d as GatewayMemberActivityEvent;
+      this.enqueueSecurityEvent("member-activity:" + event.guild_id, "member activity join event failed", () => handleMemberActivityGatewayEvent(this.env, "join", activityEvent));
+      return;
+    }
+    if (payload.t === "GUILD_MEMBER_REMOVE") {
+      const event = payload.d as GatewayMemberActivityEvent;
+      this.enqueueSecurityEvent("member-activity:" + event.guild_id, "member activity leave event failed", () => handleMemberActivityGatewayEvent(this.env, "leave", event));
       return;
     }
     if (payload.t === "MESSAGE_CREATE") {

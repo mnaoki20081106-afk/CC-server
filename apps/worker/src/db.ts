@@ -1,6 +1,7 @@
 import type { Env } from "./types";
 import { SECURITY_SCHEMA_STATEMENTS } from "./security/db";
 import { BACKUP_SCHEMA_STATEMENTS } from "./backup-db";
+import { MEMBER_ACTIVITY_SCHEMA_STATEMENTS } from "./member-activity";
 
 let schemaReady = false;
 
@@ -88,6 +89,7 @@ const SCHEMA_STATEMENTS = [
 
   ...SECURITY_SCHEMA_STATEMENTS,
   ...BACKUP_SCHEMA_STATEMENTS,
+  ...MEMBER_ACTIVITY_SCHEMA_STATEMENTS,
 ];
 
 export async function ensureSchema(env: Env): Promise<void> {

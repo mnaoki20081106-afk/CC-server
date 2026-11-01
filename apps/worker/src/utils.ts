@@ -9,6 +9,10 @@ export async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+export function snowflakeTime(id: string): number {
+  return Number((BigInt(id) >> 22n) + 1420070400000n);
+}
+
 export function randomToken(n = 32): string {
   const arr = new Uint8Array(n);
   crypto.getRandomValues(arr);

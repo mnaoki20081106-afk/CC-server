@@ -20,6 +20,9 @@ import {
 import {
   createBackup, listBackups, deleteBackup, previewRestore, startRestore, listRestoreJobs, getRestoreJobPublic,
 } from "./backup";
+import {
+  getMemberActivitySettings, saveMemberActivitySettings, primeMemberActivity, sendMemberActivityTest,
+} from "./member-activity";
 
 export { DiscordSecurityGateway } from "./security/gateway";
 
@@ -374,6 +377,47 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
     const result = await releaseLockdown(env, guildId);
     if ("error" in result) return json(result, { status: 409, env });
     return json(result, { env });
+  }
+
+  // GET/PUT /api/guilds/:id/member-activity
+  if (sub === "/member-activity") {
+    if (method === "GET") return json(await getMemberActivitySettings(env, guildId), { env });
+    if (method === "PUT") {
+      const input = await request.json() as { enabled?: boolean; channelId?: string | null; joinEnabled?: boolean; leaveEnabled?: boolean };
+      if (typeof input.enabled !== "boolean" || typeof input.joinEnabled !== "boolean" || typeof input.leaveEnabled !== "boolean") {
+        throw new HttpError(400, "入退室設定が不正です");
+      }
+      const channelId = input.channelId ? String(input.channelId) : null;
+      if (input.enabled && !channelId) throw new HttpError(400, "通知先チャンネルを選択してください");
+      let saved = await saveMemberActivitySettings(env, guildId, {
+        enabled: input.enabled, channelId, joinEnabled: input.joinEnabled, leaveEnabled: input.leaveEnabled,
+      });
+      if (saved.enabled) {
+        try {
+          saved = await primeMemberActivity(env, guildId);
+        } catch (err) {
+          if (err instanceof DiscordApiError && err.status === 403) {
+            throw new HttpError(409, "メンバー一覧を取得できません。Discord Developer Portal の Bot 設定で Server Members Intent を有効にしてから、もう一度保存してください");
+          }
+          throw err;
+        }
+      }
+      try {
+        await ensureSecurityGatewayRunning(env);
+      } catch (err) {
+        console.error("security gateway start failed", err);
+        if (saved.enabled) throw new HttpError(502, "設定は保存されましたが、リアルタイム入退室検知の起動に失敗しました。少し待ってからもう一度保存してください");
+      }
+      return json(saved, { env });
+    }
+  }
+
+  // POST /api/guilds/:id/member-activity/test
+  if (sub === "/member-activity/test" && method === "POST") {
+    const { channelId } = await request.json() as { channelId?: string };
+    if (!channelId) throw new HttpError(400, "通知先チャンネルを選択してください");
+    await sendMemberActivityTest(env, guildId, channelId);
+    return json({ ok: true }, { env });
   }
 
   // GET /api/guilds/:id/panels
