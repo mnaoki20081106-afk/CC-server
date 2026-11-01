@@ -6,6 +6,20 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": true,
   "preview_urls": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SECURITY_GATEWAY",
+        "class_name": "DiscordSecurityGateway"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "security-gateway-v1",
+      "new_sqlite_classes": ["DiscordSecurityGateway"]
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

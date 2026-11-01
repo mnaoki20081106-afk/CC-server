@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  SECURITY_GATEWAY: DurableObjectNamespace;
   WEB_ORIGIN: string;
   WEB_PUBLIC_URL: string;
   DISCORD_APPLICATION_ID: string;
