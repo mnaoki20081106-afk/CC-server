@@ -1,8 +1,11 @@
-// Ported from xaccount-bot's apps/worker/src/security/gateway.ts.
-import type { AuditEntry, DiscordMemberAddEvent, DiscordMessageEvent, GatewayStatus } from "./types";
-import type { Env } from "../types";
+import type {
+  AuditEntry,
+  DiscordMemberAddEvent,
+  DiscordMessageEvent,
+  Env,
+  GatewayStatus
+} from "./types";
 import { SecurityEngine } from "./engine";
-import { handleMemberActivityGatewayEvent, recoverMemberActivityAfterFreshSession, type GatewayMemberActivityEvent } from "../member-activity";
 
 type StoredGatewayState = GatewayStatus & {
   sequence: number | null;
@@ -12,19 +15,35 @@ type StoredGatewayState = GatewayStatus & {
   guildIds: string[];
 };
 
-type GatewayPayload = { op: number; t?: string | null; s?: number | null; d?: unknown };
+type GatewayPayload = {
+  op: number;
+  t?: string | null;
+  s?: number | null;
+  d?: unknown;
+};
 
 export class OrderedTaskLanes {
   private readonly lanes = new Map<string, Promise<void>>();
 
-  constructor(private readonly onError: (label: string, error: unknown) => void = (label, error) => console.error(label, error)) {}
+  constructor(
+    private readonly onError: (label: string, error: unknown) => void =
+      (label, error) => console.error(label, error)
+  ) {}
 
-  enqueue(lane: string, label: string, work: () => Promise<void>): void {
+  enqueue(
+    lane: string,
+    label: string,
+    work: () => Promise<void>
+  ): void {
     const previous = this.lanes.get(lane) ?? Promise.resolve();
-    const current = previous.then(work).catch(error => this.onError(label, error));
+    const current = previous
+      .then(work)
+      .catch(error => this.onError(label, error));
     this.lanes.set(lane, current);
     void current.finally(() => {
-      if (this.lanes.get(lane) === current) this.lanes.delete(lane);
+      if (this.lanes.get(lane) === current) {
+        this.lanes.delete(lane);
+      }
     });
   }
 
@@ -46,14 +65,29 @@ const GUILD_INTEGRATIONS = 1 << 4;
 const GUILD_WEBHOOKS = 1 << 5;
 const GUILD_MESSAGES = 1 << 9;
 const MESSAGE_CONTENT = 1 << 15;
-const GATEWAY_INTENTS = GUILDS | GUILD_MEMBERS | GUILD_MODERATION | GUILD_INTEGRATIONS | GUILD_WEBHOOKS | GUILD_MESSAGES | MESSAGE_CONTENT;
+const GATEWAY_INTENTS =
+  GUILDS |
+  GUILD_MEMBERS |
+  GUILD_MODERATION |
+  GUILD_INTEGRATIONS |
+  GUILD_WEBHOOKS |
+  GUILD_MESSAGES |
+  MESSAGE_CONTENT;
 const RECONNECT_CLOSE_CODE = 3001;
 
 function emptyState(): StoredGatewayState {
   return {
-    connected: false, sessionId: null, sequence: null, resumeUrl: null, heartbeatInterval: null,
-    lastHeartbeatSent: null, lastHeartbeatAck: null, lastEventAt: null, reconnectAttempts: 0,
-    botUserId: null, lastCloseCode: null, lastCloseReason: null, guildIds: [],
+    connected: false,
+    sessionId: null,
+    sequence: null,
+    resumeUrl: null,
+    heartbeatInterval: null,
+    lastHeartbeatSent: null,
+    lastHeartbeatAck: null,
+    lastEventAt: null,
+    reconnectAttempts: 0,
+    botUserId: null,
+    guildIds: []
   };
 }
 
@@ -76,47 +110,91 @@ function fatalClose(code: number): boolean {
 
 export async function ensureDiscordSecurityGateway(env: Env): Promise<void> {
   const id = env.SECURITY_GATEWAY.idFromName("discord-security");
-  const response = await env.SECURITY_GATEWAY.get(id).fetch("https://security-gateway.internal/start", { method: "POST" });
-  if (!response.ok) throw new Error("Discord Security Gateway start failed: " + response.status + " " + (await response.text()));
+  const response = await env.SECURITY_GATEWAY.get(id).fetch(
+    "https://security-gateway.internal/start",
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throw new Error(
+      "Discord Security Gateway start failed: " +
+      response.status + " " + await response.text()
+    );
+  }
 }
 
 export async function reconcileDiscordSecurityAudits(env: Env): Promise<void> {
   const id = env.SECURITY_GATEWAY.idFromName("discord-security");
-  const response = await env.SECURITY_GATEWAY.get(id).fetch("https://security-gateway.internal/reconcile", { method: "POST" });
-  if (!response.ok) throw new Error("Discord Security audit reconciliation failed: " + response.status + " " + (await response.text()));
+  const response = await env.SECURITY_GATEWAY.get(id).fetch(
+    "https://security-gateway.internal/reconcile",
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throw new Error(
+      "Discord Security audit reconciliation failed: " +
+      response.status + " " + await response.text()
+    );
+  }
 }
 
 export async function gatewayStatus(env: Env): Promise<GatewayStatus> {
   const id = env.SECURITY_GATEWAY.idFromName("discord-security");
-  const response = await env.SECURITY_GATEWAY.get(id).fetch("https://security-gateway.internal/status");
+  const response = await env.SECURITY_GATEWAY.get(id).fetch(
+    "https://security-gateway.internal/status"
+  );
   if (!response.ok) return emptyState();
-  return (await response.json()) as GatewayStatus;
+  return await response.json() as GatewayStatus;
 }
 
 export class DiscordSecurityGateway {
   private socket: WebSocket | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private socketOpenedAt: number | null = null;
   private plannedClose = false;
+  // Protocol/control frames must never wait behind Discord REST moderation
+  // calls. queue handles WebSocket state/heartbeats. Security work is ordered
+  // only within a guild+lane, so a message flood cannot block audit protection
+  // in the same or another guild.
   private queue: Promise<void> = Promise.resolve();
   private readonly eventLanes = new OrderedTaskLanes();
   private readonly engine: SecurityEngine;
 
-  constructor(private readonly state: DurableObjectState, private readonly env: Env) {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env
+  ) {
     this.engine = new SecurityEngine(env);
+    // Outbound WebSockets cannot use Durable Object WebSocket Hibernation.
+    // Keep a durable wake-up scheduled so a runtime reset can rebuild the
+    // Discord session instead of waiting for the next one-minute cron.
+    this.state.blockConcurrencyWhile(async () => {
+      const alarm = await this.state.storage.getAlarm();
+      if (alarm === null) {
+        await this.state.storage.setAlarm(Date.now() + 1000);
+      }
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/status" && request.method === "GET") {
+      // A health/status request may be the first event after a Durable Object
+      // restart. Start recovery immediately instead of only reporting offline.
+      if (!this.socket) await this.connect();
       const stored = await this.loadState();
       return Response.json({
-        connected: Boolean(this.socket) && stored.connected, sessionId: stored.sessionId, lastHeartbeatAck: stored.lastHeartbeatAck,
-        lastEventAt: stored.lastEventAt, reconnectAttempts: stored.reconnectAttempts, botUserId: stored.botUserId,
-        lastCloseCode: stored.lastCloseCode, lastCloseReason: stored.lastCloseReason,
+        connected: Boolean(this.socket) && stored.connected,
+        sessionId: stored.sessionId,
+        lastHeartbeatAck: stored.lastHeartbeatAck,
+        lastEventAt: stored.lastEventAt,
+        reconnectAttempts: stored.reconnectAttempts,
+        botUserId: stored.botUserId
       } satisfies GatewayStatus);
     }
-    if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
     if (path === "/start") {
-      if (!this.socket) await this.connect();
+      await this.connect();
       return Response.json({ ok: true });
     }
     if (path === "/stop") {
@@ -126,7 +204,9 @@ export class DiscordSecurityGateway {
     if (path === "/reconcile") {
       const stored = await this.loadState();
       for (const guildId of stored.guildIds) {
-        await this.engine.reconcileGuild(guildId).catch(error => console.error("security audit reconcile failed", guildId, error));
+        await this.engine.reconcileGuild(guildId).catch(error => {
+          console.error("security audit reconcile failed", guildId, error);
+        });
       }
       return Response.json({ ok: true, guilds: stored.guildIds.length });
     }
@@ -138,32 +218,42 @@ export class DiscordSecurityGateway {
   }
 
   async alarm(): Promise<void> {
-    this.queue = this.queue.then(() => this.handleAlarm()).catch(async error => {
+    try {
+      if (!this.socket) {
+        await this.connect();
+        return;
+      }
+      const stored = await this.loadState();
+      if (!stored.heartbeatInterval) {
+        if (
+          this.socketOpenedAt !== null &&
+          Date.now() - this.socketOpenedAt >= 20_000
+        ) {
+          console.warn("security gateway handshake timed out; reconnecting");
+          await this.scheduleReconnect(false, 1000);
+          return;
+        }
+        await this.state.storage.setAlarm(Date.now() + 5000);
+        return;
+      }
+      if (
+        stored.lastHeartbeatSent !== null &&
+        (stored.lastHeartbeatAck === null ||
+          stored.lastHeartbeatAck < stored.lastHeartbeatSent)
+      ) {
+        await this.scheduleReconnect(false);
+        return;
+      }
+      this.sendHeartbeat(stored);
+      stored.lastHeartbeatSent = Date.now();
+      await this.saveState(stored);
+      await this.state.storage.setAlarm(
+        Date.now() + Math.max(1000, stored.heartbeatInterval)
+      );
+    } catch (error) {
       console.error("security gateway alarm failed", error);
       await this.state.storage.setAlarm(Date.now() + 15_000);
-    });
-    await this.queue;
-  }
-
-  private async handleAlarm(): Promise<void> {
-    if (!this.socket) {
-      await this.connect();
-      return;
     }
-    const stored = await this.loadState();
-    if (!stored.heartbeatInterval) {
-      await this.state.storage.setAlarm(Date.now() + 5000);
-      return;
-    }
-    if (stored.lastHeartbeatSent !== null && (stored.lastHeartbeatAck === null || stored.lastHeartbeatAck < stored.lastHeartbeatSent)) {
-      await this.scheduleReconnect(false);
-      return;
-    }
-    const now = Date.now();
-    this.sendHeartbeat(stored);
-    stored.lastHeartbeatSent = now;
-    await this.saveState(stored);
-    await this.state.storage.setAlarm(now + Math.max(1000, stored.heartbeatInterval));
   }
 
   private async loadState(): Promise<StoredGatewayState> {
@@ -175,17 +265,42 @@ export class DiscordSecurityGateway {
   }
 
   private async gatewayUrl(): Promise<string> {
-    const response = await fetch("https://discord.com/api/v10/gateway/bot", { headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` } });
-    if (!response.ok) throw new Error("Discord gateway URL failed: " + response.status + " " + (await response.text()));
-    const data = (await response.json()) as { url?: string };
+    const response = await fetch("https://discord.com/api/v10/gateway/bot", {
+      headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!response.ok) {
+      throw new Error(
+        "Discord gateway URL failed: " + response.status + " " + await response.text()
+      );
+    }
+    const data = await response.json() as { url?: string };
     if (!data.url) throw new Error("Discord gateway URL missing");
     return data.url;
   }
 
   private async connect(): Promise<void> {
     if (this.socket) return;
+    if (this.connectPromise) {
+      await this.connectPromise;
+      return;
+    }
+
+    const attempt = this.connectOnce();
+    this.connectPromise = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this.connectPromise === attempt) this.connectPromise = null;
+    }
+  }
+
+  private async connectOnce(): Promise<void> {
+    if (this.socket) return;
     const stored = await this.loadState();
-    const resumable = Boolean(stored.sessionId) && stored.sequence !== null && Boolean(stored.resumeUrl);
+    const resumable =
+      Boolean(stored.sessionId) &&
+      stored.sequence !== null &&
+      Boolean(stored.resumeUrl);
 
     let baseUrl: string;
     try {
@@ -198,7 +313,9 @@ export class DiscordSecurityGateway {
 
     let response: Response;
     try {
-      response = await fetch(websocketUpgradeUrl(baseUrl), { headers: { Upgrade: "websocket" } });
+      response = await fetch(websocketUpgradeUrl(baseUrl), {
+        headers: { Upgrade: "websocket" }
+      });
     } catch (error) {
       console.error("security websocket upgrade failed", error);
       await this.scheduleReconnect(false);
@@ -214,27 +331,35 @@ export class DiscordSecurityGateway {
     const socket = response.webSocket;
     socket.accept();
     this.socket = socket;
+    this.socketOpenedAt = Date.now();
     this.plannedClose = false;
 
     socket.addEventListener("message", event => {
       if (this.socket !== socket) return;
-      this.queue = this.queue.then(() => this.handleMessage(String(event.data))).catch(error => console.error("security gateway event failed", error));
+      this.queue = this.queue
+        .then(() => this.handleMessage(String(event.data)))
+        .catch(error => console.error("security gateway event failed", error));
     });
 
     socket.addEventListener("close", event => {
       if (this.socket !== socket) return;
       this.socket = null;
+      this.socketOpenedAt = null;
       if (this.plannedClose) {
         this.plannedClose = false;
         return;
       }
-      void this.scheduleReconnect(clearSessionOnClose(event.code), fatalClose(event.code) ? 60_000 : undefined, event.code, event.reason || "websocket closed");
+      void this.scheduleReconnect(
+        clearSessionOnClose(event.code),
+        fatalClose(event.code) ? 60_000 : undefined
+      );
     });
 
     socket.addEventListener("error", () => {
       if (this.socket !== socket) return;
       this.socket = null;
-      if (!this.plannedClose) void this.scheduleReconnect(false, undefined, null, "websocket error");
+      this.socketOpenedAt = null;
+      if (!this.plannedClose) void this.scheduleReconnect(false);
     });
 
     await this.state.storage.setAlarm(Date.now() + 10_000);
@@ -244,21 +369,27 @@ export class DiscordSecurityGateway {
     await this.state.storage.deleteAlarm();
     if (this.socket) {
       this.plannedClose = true;
-      try { this.socket.close(1000, "security gateway stopped"); } catch { /* already closed */ }
+      try {
+        this.socket.close(1000, "security gateway stopped");
+      } catch {
+        // already closed
+      }
       this.socket = null;
+      this.socketOpenedAt = null;
     }
     await this.state.storage.put(STATE_KEY, emptyState());
   }
 
-  private async scheduleReconnect(clearSession: boolean, forcedDelay?: number, closeCode?: number | null, closeReason?: string): Promise<void> {
+  private async scheduleReconnect(
+    clearSession: boolean,
+    forcedDelay?: number
+  ): Promise<void> {
     const stored = await this.loadState();
     stored.connected = false;
     stored.reconnectAttempts += 1;
     stored.heartbeatInterval = null;
     stored.lastHeartbeatSent = null;
     stored.lastHeartbeatAck = null;
-    if (closeCode !== undefined) stored.lastCloseCode = closeCode;
-    if (closeReason !== undefined) stored.lastCloseReason = closeReason;
     if (clearSession) {
       stored.sessionId = null;
       stored.sequence = null;
@@ -268,19 +399,32 @@ export class DiscordSecurityGateway {
 
     if (this.socket) {
       this.plannedClose = true;
-      try { this.socket.close(RECONNECT_CLOSE_CODE, "reconnect"); } catch { /* already closed */ }
+      try {
+        this.socket.close(RECONNECT_CLOSE_CODE, "reconnect");
+      } catch {
+        // already closed
+      }
       this.socket = null;
     }
-    const delay = forcedDelay ?? Math.min(60_000, 1000 * 2 ** Math.min(stored.reconnectAttempts, 5));
+    this.socketOpenedAt = null;
+    const delay =
+      forcedDelay ??
+      Math.min(60_000, 1000 * 2 ** Math.min(stored.reconnectAttempts, 5));
     await this.state.storage.setAlarm(Date.now() + delay);
   }
 
   private async handleMessage(raw: string): Promise<void> {
     let payload: GatewayPayload;
-    try { payload = JSON.parse(raw) as GatewayPayload; } catch { return; }
+    try {
+      payload = JSON.parse(raw) as GatewayPayload;
+    } catch {
+      return;
+    }
 
     const stored = await this.loadState();
-    if (payload.s !== undefined && payload.s !== null) stored.sequence = payload.s;
+    if (payload.s !== undefined && payload.s !== null) {
+      stored.sequence = payload.s;
+    }
 
     switch (payload.op) {
       case 10: {
@@ -292,9 +436,12 @@ export class DiscordSecurityGateway {
         stored.heartbeatInterval = hello.heartbeat_interval;
         stored.lastHeartbeatAck = Date.now();
         stored.lastHeartbeatSent = null;
+        this.socketOpenedAt = null;
         await this.saveState(stored);
         await this.identifyOrResume(stored);
-        await this.state.storage.setAlarm(Date.now() + Math.max(1000, Math.floor(hello.heartbeat_interval * Math.random())));
+        await this.state.storage.setAlarm(
+          Date.now() + Math.max(1000, Math.floor(hello.heartbeat_interval * Math.random()))
+        );
         return;
       }
       case 11:
@@ -321,12 +468,27 @@ export class DiscordSecurityGateway {
   private async identifyOrResume(stored: StoredGatewayState): Promise<void> {
     if (!this.socket) return;
     if (stored.sessionId && stored.sequence !== null && stored.resumeUrl) {
-      this.socket.send(JSON.stringify({ op: 6, d: { token: this.env.DISCORD_BOT_TOKEN, session_id: stored.sessionId, seq: stored.sequence } }));
+      this.socket.send(JSON.stringify({
+        op: 6,
+        d: {
+          token: this.env.DISCORD_BOT_TOKEN,
+          session_id: stored.sessionId,
+          seq: stored.sequence
+        }
+      }));
       return;
     }
     this.socket.send(JSON.stringify({
       op: 2,
-      d: { token: this.env.DISCORD_BOT_TOKEN, intents: GATEWAY_INTENTS, properties: { os: "cloudflare", browser: "cc-server-security", device: "cc-server-security" } },
+      d: {
+        token: this.env.DISCORD_BOT_TOKEN,
+        intents: GATEWAY_INTENTS,
+        properties: {
+          os: "cloudflare",
+          browser: "discord-security",
+          device: "discord-security"
+        }
+      }
     }));
   }
 
@@ -335,36 +497,46 @@ export class DiscordSecurityGateway {
     this.socket.send(JSON.stringify({ op: 1, d: stored.sequence }));
   }
 
-  private enqueueSecurityEvent(lane: string, label: string, work: () => Promise<void>): void {
+  private enqueueSecurityEvent(
+    lane: string,
+    label: string,
+    work: () => Promise<void>
+  ): void {
     this.eventLanes.enqueue(lane, label, work);
   }
 
-  private async handleDispatch(payload: GatewayPayload, stored: StoredGatewayState): Promise<void> {
+  private async handleDispatch(
+    payload: GatewayPayload,
+    stored: StoredGatewayState
+  ): Promise<void> {
     if (payload.t === "READY") {
-      const ready = payload.d as { session_id?: string; resume_gateway_url?: string; user?: { id?: string }; guilds?: Array<{ id?: string }> };
+      const ready = payload.d as {
+        session_id?: string;
+        resume_gateway_url?: string;
+        user?: { id?: string };
+        guilds?: Array<{ id?: string }>;
+      };
       stored.connected = true;
       stored.sessionId = ready.session_id ?? null;
       stored.resumeUrl = ready.resume_gateway_url ?? stored.resumeUrl;
       stored.reconnectAttempts = 0;
       stored.botUserId = ready.user?.id ?? null;
-      stored.lastCloseCode = null;
-      stored.lastCloseReason = null;
-      stored.guildIds = (ready.guilds ?? []).map(guild => String(guild.id ?? "")).filter(Boolean);
+      stored.guildIds = (ready.guilds ?? [])
+        .map(guild => String(guild.id ?? ""))
+        .filter(Boolean);
       await this.saveState(stored);
-
       for (const guildId of stored.guildIds) {
-        this.enqueueSecurityEvent("audit:" + guildId, "initial audit reconcile failed " + guildId, () => this.engine.reconcileGuild(guildId));
+        this.enqueueSecurityEvent(
+          "audit:" + guildId,
+          "initial audit reconcile failed " + guildId,
+          () => this.engine.reconcileGuild(guildId)
+        );
       }
-      recoverMemberActivityAfterFreshSession(this.env).catch(error => {
-        console.error("member activity fresh-session recovery failed", error);
-      });
       return;
     }
     if (payload.t === "RESUMED") {
       stored.connected = true;
       stored.reconnectAttempts = 0;
-      stored.lastCloseCode = null;
-      stored.lastCloseReason = null;
       await this.saveState(stored);
       return;
     }
@@ -373,7 +545,11 @@ export class DiscordSecurityGateway {
       if (guildId && !stored.guildIds.includes(guildId)) {
         stored.guildIds.push(guildId);
         await this.saveState(stored);
-        this.enqueueSecurityEvent("audit:" + guildId, "guild create audit reconcile failed " + guildId, () => this.engine.reconcileGuild(guildId));
+        this.enqueueSecurityEvent(
+          "audit:" + guildId,
+          "guild create audit reconcile failed " + guildId,
+          () => this.engine.reconcileGuild(guildId)
+        );
       }
       return;
     }
@@ -387,24 +563,29 @@ export class DiscordSecurityGateway {
     }
     if (payload.t === "GUILD_AUDIT_LOG_ENTRY_CREATE") {
       const entry = payload.d as AuditEntry;
-      this.enqueueSecurityEvent("audit:" + String(entry.guild_id || "unknown"), "security audit event failed", () => this.engine.handleAudit(entry));
+      this.enqueueSecurityEvent(
+        "audit:" + String(entry.guild_id || "unknown"),
+        "security audit event failed",
+        () => this.engine.handleAudit(entry)
+      );
       return;
     }
     if (payload.t === "GUILD_MEMBER_ADD") {
       const event = payload.d as DiscordMemberAddEvent;
-      this.enqueueSecurityEvent("member:" + event.guild_id, "security member event failed", () => this.engine.handleJoin(event));
-      const activityEvent = payload.d as GatewayMemberActivityEvent;
-      this.enqueueSecurityEvent("member-activity:" + event.guild_id, "member activity join event failed", () => handleMemberActivityGatewayEvent(this.env, "join", activityEvent));
-      return;
-    }
-    if (payload.t === "GUILD_MEMBER_REMOVE") {
-      const event = payload.d as GatewayMemberActivityEvent;
-      this.enqueueSecurityEvent("member-activity:" + event.guild_id, "member activity leave event failed", () => handleMemberActivityGatewayEvent(this.env, "leave", event));
+      this.enqueueSecurityEvent(
+        "member:" + event.guild_id,
+        "security member event failed",
+        () => this.engine.handleJoin(event)
+      );
       return;
     }
     if (payload.t === "MESSAGE_CREATE") {
       const event = payload.d as DiscordMessageEvent;
-      this.enqueueSecurityEvent("message:" + String(event.guild_id || "dm"), "security message event failed", () => this.engine.handleMessage(event));
+      this.enqueueSecurityEvent(
+        "message:" + String(event.guild_id || "dm"),
+        "security message event failed",
+        () => this.engine.handleMessage(event)
+      );
     }
   }
 }

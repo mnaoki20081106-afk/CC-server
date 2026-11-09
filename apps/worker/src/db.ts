@@ -1,132 +1,585 @@
-import type { Env } from "./types";
-import { SECURITY_SCHEMA_STATEMENTS } from "./security/db";
-import { BACKUP_SCHEMA_STATEMENTS } from "./backup-db";
-import { MEMBER_ACTIVITY_SCHEMA_STATEMENTS } from "./member-activity";
+import type { DashboardSession, Env, GuildSettings, PaymentRow, ProductRow, SessionRow } from "./types";
 
-let schemaReady = false;
+export const DEFAULT_SETTINGS: GuildSettings = {
+  securityEnabled: true,
+  antiSpam: true,
+  spamMax: 6,
+  spamWindowSeconds: 8,
+  blockInvites: true,
+  mentionLimit: 6,
+  antiRaid: true,
+  raidJoins: 10,
+  raidWindowSeconds: 20,
+  antiNuke: true,
+  nukeActions: 4,
+  nukeWindowSeconds: 15,
+  logChannelId: null,
+  verifiedRoleId: null,
+  minAccountAgeDays: 3,
+  ticketSupportRoleIds: [],
+  trustedUserIds: [],
+  trustedRoleIds: []
+};
 
-// D1's env.DB.exec() splits its input on newlines and runs each line as its
-// own statement, so a multi-line CREATE TABLE breaks mid-statement. Use
-// batch() with one prepare() per statement instead — each is sent whole.
-const SCHEMA_STATEMENTS = [
-  `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+const schema = `
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '5');
 
-  `CREATE TABLE IF NOT EXISTS dashboard_sessions (
-    token_hash TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-  )`,
+CREATE TABLE IF NOT EXISTS guild_settings (
+  guild_id TEXT PRIMARY KEY,
+  config TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL
+);
 
-  `CREATE TABLE IF NOT EXISTS guild_config (
-    guild_id TEXT PRIMARY KEY,
-    admin_role_id TEXT,
-    mod_role_id TEXT,
-    log_channel_id TEXT,
-    verified_role_id TEXT,
-    verify_channel_id TEXT,
-    welcome_channel_id TEXT,
-    welcome_message TEXT,
-    leave_channel_id TEXT,
-    leave_message TEXT,
-    ticket_category_id TEXT,
-    ticket_log_channel_id TEXT,
-    anti_spam_enabled INTEGER DEFAULT 0,
-    anti_spam_threshold INTEGER DEFAULT 5,
-    anti_spam_window_ms INTEGER DEFAULT 7000,
-    anti_link_enabled INTEGER DEFAULT 0,
-    anti_link_whitelist TEXT DEFAULT '[]',
-    raid_protection_enabled INTEGER DEFAULT 0,
-    raid_join_threshold INTEGER DEFAULT 10,
-    raid_window_ms INTEGER DEFAULT 10000,
-    raid_action TEXT DEFAULT 'lock'
-  )`,
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
 
-  `CREATE TABLE IF NOT EXISTS panels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    message_id TEXT,
-    channel_id TEXT,
-    created_by TEXT NOT NULL DEFAULT 'admin',
-    created_at INTEGER NOT NULL
-  )`,
+CREATE TABLE IF NOT EXISTS web_sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  avatar TEXT,
+  access_token_enc TEXT NOT NULL,
+  refresh_token_enc TEXT NOT NULL,
+  token_expires_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON web_sessions(user_id);
 
-  `CREATE TABLE IF NOT EXISTS panel_buttons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    panel_id INTEGER NOT NULL,
-    label TEXT NOT NULL,
-    style TEXT NOT NULL DEFAULT 'Primary',
-    emoji TEXT,
-    action_type TEXT NOT NULL,
-    action_value TEXT NOT NULL
-  )`,
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+  token_hash TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
 
-  `CREATE TABLE IF NOT EXISTS amazon_vending_config (
-    guild_id TEXT PRIMARY KEY,
-    panel_title TEXT NOT NULL DEFAULT 'Amazon自販機',
-    panel_description TEXT DEFAULT 'Amazon商品をLTCで購入できます。',
-    ltc_address TEXT,
-    api_type TEXT NOT NULL DEFAULT 'rainforest',
-    api_key TEXT
-  )`,
+CREATE TABLE IF NOT EXISTS products (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price_yen INTEGER NOT NULL CHECK (price_yen > 0),
+  active INTEGER NOT NULL DEFAULT 1,
+  delivery_type TEXT NOT NULL CHECK (delivery_type IN ('role','text')),
+  role_id TEXT,
+  delivery_text TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS products_guild_idx ON products(guild_id);
 
-  `CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
-    id TEXT PRIMARY KEY,
-    guild_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    asin TEXT NOT NULL,
-    product_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  )`,
+CREATE TABLE IF NOT EXISTS payments (
+  id TEXT PRIMARY KEY,
+  merchant_payment_id TEXT UNIQUE NOT NULL,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  paypay_url TEXT,
+  amount_yen INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS payments_pending_idx ON payments(status, delivered_at, created_at);
 
-  `CREATE TABLE IF NOT EXISTS bot_guild_cache (
-    guild_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    icon TEXT,
-    seen_at INTEGER NOT NULL
-  )`,
+CREATE TABLE IF NOT EXISTS verification_challenges (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  code TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 
-  `CREATE TABLE IF NOT EXISTS external_auths (
-    id TEXT PRIMARY KEY,
-    guild_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS external_auths_guild_idx ON external_auths(guild_id)`,
+CREATE TABLE IF NOT EXISTS audit_cursors (
+  guild_id TEXT PRIMARY KEY,
+  last_entry_id TEXT,
+  updated_at INTEGER NOT NULL
+);
 
-  ...SECURITY_SCHEMA_STATEMENTS,
-  ...BACKUP_SCHEMA_STATEMENTS,
-  ...MEMBER_ACTIVITY_SCHEMA_STATEMENTS,
-];
+CREATE TABLE IF NOT EXISTS bot_guild_cache (
+  guild_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  icon TEXT,
+  seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bot_guild_cache_seen_idx ON bot_guild_cache(seen_at);
 
+CREATE TABLE IF NOT EXISTS bot_guild_membership (
+  guild_id TEXT PRIMARY KEY,
+  seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bot_guild_membership_seen_idx ON bot_guild_membership(seen_at);
+
+-- Amazon自販機 (CC-server)
+CREATE TABLE IF NOT EXISTS amazon_vending_config (
+  guild_id TEXT PRIMARY KEY,
+  panel_title TEXT NOT NULL DEFAULT 'Amazon自販機',
+  panel_description TEXT DEFAULT 'Amazon商品をLTCで購入できます。',
+  ltc_address TEXT,
+  api_type TEXT NOT NULL DEFAULT 'rainforest',
+  api_key TEXT
+);
+
+CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  asin TEXT NOT NULL,
+  product_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS guild_config (
+  guild_id TEXT PRIMARY KEY,
+  admin_role_id TEXT,
+  mod_role_id TEXT,
+  log_channel_id TEXT,
+  verified_role_id TEXT,
+  verify_channel_id TEXT,
+  welcome_channel_id TEXT,
+  welcome_message TEXT,
+  leave_channel_id TEXT,
+  leave_message TEXT,
+  ticket_category_id TEXT,
+  ticket_log_channel_id TEXT,
+  anti_spam_enabled INTEGER DEFAULT 0,
+  anti_spam_threshold INTEGER DEFAULT 5,
+  anti_spam_window_ms INTEGER DEFAULT 7000,
+  anti_link_enabled INTEGER DEFAULT 0,
+  anti_link_whitelist TEXT DEFAULT '[]',
+  raid_protection_enabled INTEGER DEFAULT 0,
+  raid_join_threshold INTEGER DEFAULT 10,
+  raid_window_ms INTEGER DEFAULT 10000,
+  raid_action TEXT DEFAULT 'lock'
+);
+`;
+
+const schemaInitializations = new WeakMap<D1Database, Promise<void>>();
 export async function ensureSchema(env: Env): Promise<void> {
-  if (schemaReady) return;
-  await env.DB.batch(SCHEMA_STATEMENTS.map(sql => env.DB.prepare(sql)));
-  schemaReady = true;
+  let initialization = schemaInitializations.get(env.DB);
+  if (!initialization) {
+    initialization = (async () => {
+      // D1 exec splits on newlines, including those inside CREATE TABLE.
+      // This static DDL contains no semicolons in literals or triggers.
+      const statements = schema.split(";").map(sql => sql.trim()).filter(Boolean);
+      await env.DB.batch([
+        ...statements.map(sql => env.DB.prepare(sql)),
+        env.DB.prepare(`
+          INSERT INTO meta(key, value) VALUES ('schema_version', '5')
+          ON CONFLICT(key) DO UPDATE SET value='5'
+        `)
+      ]);
+    })();
+    schemaInitializations.set(env.DB, initialization);
+    initialization.catch(() => schemaInitializations.delete(env.DB));
+  }
+  await initialization;
 }
 
-// ── dashboard sessions ────────────────────────────────────────────────────────
+export async function cleanExpired(env: Env): Promise<void> {
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM oauth_states WHERE expires_at < ?").bind(now),
+    env.DB.prepare("DELETE FROM web_sessions WHERE expires_at < ?").bind(now),
+    env.DB.prepare("DELETE FROM dashboard_sessions WHERE expires_at < ?").bind(now),
+    env.DB.prepare("DELETE FROM verification_challenges WHERE expires_at < ?").bind(now)
+  ]);
+}
 
-export async function createDashboardSession(env: Env, tokenHash: string, expiresAt: number): Promise<void> {
+export async function putOAuthState(env: Env, state: string): Promise<void> {
+  await env.DB.prepare("INSERT INTO oauth_states(state, expires_at) VALUES (?, ?)")
+    .bind(state, Date.now() + 10 * 60_000).run();
+}
+
+export async function consumeOAuthState(env: Env, state: string): Promise<boolean> {
+  const now = Date.now();
+  const found = await env.DB.prepare(
+    "SELECT state FROM oauth_states WHERE state=? AND expires_at>?"
+  ).bind(state, now).first();
+  if (!found) return false;
+  await env.DB.prepare("DELETE FROM oauth_states WHERE state=?").bind(state).run();
+  return true;
+}
+
+export async function createSession(env: Env, row: SessionRow): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO web_sessions(
+      token_hash,user_id,username,avatar,access_token_enc,refresh_token_enc,
+      token_expires_at,expires_at,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?)
+  `).bind(
+    row.token_hash,row.user_id,row.username,row.avatar,row.access_token_enc,
+    row.refresh_token_enc,row.token_expires_at,row.expires_at,Date.now()
+  ).run();
+}
+
+export async function getSession(env: Env, tokenHash: string): Promise<SessionRow | null> {
+  return await env.DB.prepare(
+    "SELECT * FROM web_sessions WHERE token_hash=? AND expires_at>?"
+  ).bind(tokenHash, Date.now()).first<SessionRow>() ?? null;
+}
+
+export async function updateSessionTokens(
+  env: Env,
+  tokenHash: string,
+  accessEnc: string,
+  refreshEnc: string,
+  expiresAt: number
+): Promise<void> {
+  await env.DB.prepare(`
+    UPDATE web_sessions
+    SET access_token_enc=?, refresh_token_enc=?, token_expires_at=?
+    WHERE token_hash=?
+  `).bind(accessEnc, refreshEnc, expiresAt, tokenHash).run();
+}
+
+export async function deleteSession(env: Env, tokenHash: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM web_sessions WHERE token_hash=?").bind(tokenHash).run();
+}
+
+
+async function ensureDashboardSessionTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS dashboard_sessions (
+      token_hash TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `).run();
+}
+
+export async function dashboardSessionStorageReady(env: Env): Promise<boolean> {
+  try {
+    await ensureDashboardSessionTable(env);
+    await env.DB.prepare("SELECT token_hash FROM dashboard_sessions LIMIT 1").first();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function createDashboardSession(
+  env: Env,
+  tokenHash: string,
+  expiresAt: number
+): Promise<void> {
+  await ensureDashboardSessionTable(env);
   await env.DB.prepare(
-    "INSERT INTO dashboard_sessions(token_hash,expires_at,created_at) VALUES(?,?,?)"
+    "INSERT INTO dashboard_sessions(token_hash,expires_at,created_at) VALUES (?,?,?)"
   ).bind(tokenHash, expiresAt, Date.now()).run();
 }
 
-export async function getDashboardSession(env: Env, tokenHash: string): Promise<{ token_hash: string; expires_at: number } | null> {
-  const row = await env.DB.prepare(
-    "SELECT token_hash,expires_at FROM dashboard_sessions WHERE token_hash=? AND expires_at>?"
-  ).bind(tokenHash, Date.now()).first<{ token_hash: string; expires_at: number }>();
-  return row ?? null;
+export async function getDashboardSession(
+  env: Env,
+  tokenHash: string
+): Promise<DashboardSession | null> {
+  await ensureDashboardSessionTable(env);
+  return await env.DB.prepare(
+    "SELECT token_hash,expires_at,created_at FROM dashboard_sessions WHERE token_hash=? AND expires_at>?"
+  ).bind(tokenHash, Date.now()).first<DashboardSession>() ?? null;
 }
 
-export async function cleanExpiredSessions(env: Env): Promise<void> {
-  await env.DB.prepare("DELETE FROM dashboard_sessions WHERE expires_at<?").bind(Date.now()).run();
+export async function deleteDashboardSession(env: Env, tokenHash: string): Promise<void> {
+  await ensureDashboardSessionTable(env);
+  await env.DB.prepare("DELETE FROM dashboard_sessions WHERE token_hash=?").bind(tokenHash).run();
 }
 
-// ── guild config ──────────────────────────────────────────────────────────────
+export async function getGuildSettings(env: Env, guildId: string): Promise<GuildSettings> {
+  const row = await env.DB.prepare("SELECT config FROM guild_settings WHERE guild_id=?")
+    .bind(guildId).first<{config:string}>();
+  if (!row) return { ...DEFAULT_SETTINGS };
+  let parsed: Partial<GuildSettings> = {};
+  try { parsed = JSON.parse(row.config) as Partial<GuildSettings>; } catch {}
+  return { ...DEFAULT_SETTINGS, ...parsed };
+}
+
+export async function saveGuildSettings(
+  env: Env,
+  guildId: string,
+  patch: Partial<GuildSettings>
+): Promise<GuildSettings> {
+  const next = { ...(await getGuildSettings(env, guildId)), ...patch };
+  await env.DB.prepare(`
+    INSERT INTO guild_settings(guild_id, config, updated_at) VALUES (?,?,?)
+    ON CONFLICT(guild_id) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at
+  `).bind(guildId, JSON.stringify(next), Date.now()).run();
+  return next;
+}
+
+export async function listAllGuildSettings(env: Env, limit=20): Promise<Array<{guild_id:string;config:string}>> {
+  const result = await env.DB.prepare(
+    "SELECT guild_id, config FROM guild_settings ORDER BY updated_at DESC LIMIT ?"
+  ).bind(limit).all<{guild_id:string;config:string}>();
+  return result.results;
+}
+
+async function ensureBotGuildCacheTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS bot_guild_cache (
+      guild_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      icon TEXT,
+      seen_at INTEGER NOT NULL
+    )
+  `).run();
+}
+
+export type CachedBotGuild = {
+  id: string;
+  name: string;
+  icon: string | null;
+  seenAt: number;
+};
+
+export async function replaceBotGuildCache(
+  env: Env,
+  guilds: Array<{ id: string; name: string; icon: string | null }>
+): Promise<void> {
+  await ensureBotGuildCacheTable(env);
+  const seenAt = Date.now();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM bot_guild_cache"),
+    ...guilds.map(guild =>
+      env.DB.prepare(
+        "INSERT INTO bot_guild_cache(guild_id,name,icon,seen_at) VALUES (?,?,?,?)"
+      ).bind(guild.id, guild.name, guild.icon, seenAt)
+    )
+  ]);
+}
+
+export async function listBotGuildCache(
+  env: Env,
+  maxAgeMs = 6 * 60 * 60_000
+): Promise<CachedBotGuild[]> {
+  await ensureBotGuildCacheTable(env);
+  const result = await env.DB.prepare(`
+    SELECT guild_id AS id, name, icon, seen_at AS seenAt
+    FROM bot_guild_cache
+    WHERE seen_at >= ?
+    ORDER BY name COLLATE NOCASE, guild_id
+  `).bind(Date.now() - Math.max(1, maxAgeMs)).all<CachedBotGuild>();
+  return result.results;
+}
+
+export async function upsertBotGuildCache(
+  env: Env,
+  guild: { id:string; name:string; icon:string|null }
+): Promise<void> {
+  await ensureBotGuildCacheTable(env);
+  await env.DB.prepare(`
+    INSERT INTO bot_guild_cache(guild_id,name,icon,seen_at) VALUES (?,?,?,?)
+    ON CONFLICT(guild_id) DO UPDATE SET
+      name=excluded.name,
+      icon=excluded.icon,
+      seen_at=excluded.seen_at
+  `).bind(guild.id,guild.name,guild.icon,Date.now()).run();
+}
+
+export async function deleteBotGuildCache(
+  env: Env,
+  guildId: string
+): Promise<void> {
+  await ensureBotGuildCacheTable(env);
+  await env.DB.prepare("DELETE FROM bot_guild_cache WHERE guild_id=?")
+    .bind(guildId).run();
+}
+
+async function ensureBotGuildMembershipTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS bot_guild_membership (
+      guild_id TEXT PRIMARY KEY,
+      seen_at INTEGER NOT NULL
+    )
+  `).run();
+}
+
+export async function rememberBotGuildMembership(
+  env: Env,
+  guildId: string
+): Promise<void> {
+  if (!/^\d+$/.test(guildId)) return;
+  await ensureBotGuildMembershipTable(env);
+  await env.DB.prepare(`
+    INSERT INTO bot_guild_membership(guild_id,seen_at) VALUES (?,?)
+    ON CONFLICT(guild_id) DO UPDATE SET seen_at=excluded.seen_at
+  `).bind(guildId,Date.now()).run();
+}
+
+export async function forgetBotGuildMembership(
+  env: Env,
+  guildId: string
+): Promise<void> {
+  await ensureBotGuildMembershipTable(env);
+  await env.DB.prepare("DELETE FROM bot_guild_membership WHERE guild_id=?")
+    .bind(guildId).run();
+}
+
+export async function replaceBotGuildMembership(
+  env: Env,
+  guildIds: string[]
+): Promise<void> {
+  await ensureBotGuildMembershipTable(env);
+  const seenAt=Date.now();
+  const unique=[...new Set(guildIds.filter(id=>/^\d+$/.test(id)))];
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM bot_guild_membership"),
+    ...unique.map(id=>
+      env.DB.prepare(
+        "INSERT INTO bot_guild_membership(guild_id,seen_at) VALUES (?,?)"
+      ).bind(id,seenAt)
+    )
+  ]);
+}
+
+export async function listKnownGuildIds(env: Env): Promise<string[]> {
+  const queries = [
+    "SELECT guild_id AS id FROM bot_guild_membership",
+    "SELECT guild_id AS id FROM bot_guild_cache",
+    "SELECT guild_id AS id FROM guild_settings",
+    "SELECT guild_id AS id FROM products",
+    "SELECT guild_id AS id FROM payments",
+    "SELECT source_guild_id AS id FROM guild_backups",
+    "SELECT target_guild_id AS id FROM guild_restore_jobs",
+    "SELECT guild_id AS id FROM member_recovery_tokens",
+    "SELECT guild_id AS id FROM panel_deployments",
+    "SELECT guild_id AS id FROM vending_machines",
+    "SELECT guild_id AS id FROM vending_stock_notifications",
+    "SELECT guild_id AS id FROM vending_orders",
+    "SELECT guild_id AS id FROM vending_achievement_rooms",
+    "SELECT guild_id AS id FROM vending_achievement_routes",
+    "SELECT guild_id AS id FROM member_activity_settings",
+    "SELECT guild_id AS id FROM member_activity_members"
+  ];
+
+  const ids = new Set<string>();
+  for (const sql of queries) {
+    try {
+      const result = await env.DB.prepare(sql + " LIMIT 250").all<{ id:string }>();
+      for (const row of result.results ?? []) {
+        const id = String(row.id ?? "");
+        if (/^\d+$/.test(id)) ids.add(id);
+      }
+    } catch {
+      // Optional feature tables are created lazily. Missing tables simply mean
+      // there is no guild evidence from that subsystem yet.
+    }
+  }
+  return [...ids];
+}
+
+export async function listProducts(env: Env, guildId: string): Promise<ProductRow[]> {
+  const result = await env.DB.prepare(
+    "SELECT * FROM products WHERE guild_id=? AND active=1 ORDER BY created_at DESC"
+  ).bind(guildId).all<ProductRow>();
+  return result.results;
+}
+
+export async function getProduct(env: Env, id: string): Promise<ProductRow | null> {
+  return await env.DB.prepare("SELECT * FROM products WHERE id=?")
+    .bind(id).first<ProductRow>() ?? null;
+}
+
+export async function createProduct(env: Env, row: ProductRow): Promise<ProductRow> {
+  await env.DB.prepare(`
+    INSERT INTO products(
+      id,guild_id,name,description,price_yen,active,delivery_type,role_id,delivery_text,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).bind(
+    row.id,row.guild_id,row.name,row.description,row.price_yen,row.active,
+    row.delivery_type,row.role_id,row.delivery_text,row.created_at
+  ).run();
+  return row;
+}
+
+export async function deleteProduct(env: Env, guildId: string, id: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    "UPDATE products SET active=0 WHERE guild_id=? AND id=? AND active=1"
+  ).bind(guildId,id).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function createPayment(env: Env, row: PaymentRow): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO payments(
+      id,merchant_payment_id,guild_id,user_id,product_id,status,paypay_url,
+      amount_yen,created_at,updated_at,delivered_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `).bind(
+    row.id,row.merchant_payment_id,row.guild_id,row.user_id,row.product_id,row.status,
+    row.paypay_url,row.amount_yen,row.created_at,row.updated_at,row.delivered_at
+  ).run();
+}
+
+export async function getPaymentByMerchantId(env: Env, merchantId: string): Promise<PaymentRow | null> {
+  return await env.DB.prepare("SELECT * FROM payments WHERE merchant_payment_id=?")
+    .bind(merchantId).first<PaymentRow>() ?? null;
+}
+
+export async function listPendingPayments(env: Env, limit=10): Promise<PaymentRow[]> {
+  const result = await env.DB.prepare(`
+    SELECT * FROM payments
+    WHERE delivered_at IS NULL
+      AND created_at > ?
+      AND status NOT IN ('CANCELED','EXPIRED','FAILED')
+    ORDER BY created_at ASC
+    LIMIT ?
+  `).bind(Date.now()-24*60*60_000,limit).all<PaymentRow>();
+  return result.results;
+}
+
+export async function setPaymentStatus(env: Env, id:string, status:string): Promise<void> {
+  await env.DB.prepare("UPDATE payments SET status=?, updated_at=? WHERE id=?")
+    .bind(status,Date.now(),id).run();
+}
+
+export async function markDelivered(env: Env, id:string): Promise<void> {
+  await env.DB.prepare("UPDATE payments SET delivered_at=?, updated_at=? WHERE id=?")
+    .bind(Date.now(),Date.now(),id).run();
+}
+
+export async function putChallenge(
+  env:Env,id:string,guildId:string,userId:string,code:string
+): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO verification_challenges(id,guild_id,user_id,code,expires_at)
+    VALUES (?,?,?,?,?)
+  `).bind(id,guildId,userId,code,Date.now()+5*60_000).run();
+}
+
+export async function getChallenge(env:Env,id:string): Promise<{
+  guild_id:string;user_id:string;code:string;expires_at:number
+}|null> {
+  return env.DB.prepare(
+    "SELECT guild_id,user_id,code,expires_at FROM verification_challenges WHERE id=?"
+  ).bind(id).first<{guild_id:string;user_id:string;code:string;expires_at:number}>();
+}
+
+export async function deleteChallenge(env:Env,id:string): Promise<void> {
+  await env.DB.prepare("DELETE FROM verification_challenges WHERE id=?").bind(id).run();
+}
+
+export async function getAuditCursor(env:Env,guildId:string): Promise<string|null> {
+  const row=await env.DB.prepare("SELECT last_entry_id FROM audit_cursors WHERE guild_id=?")
+    .bind(guildId).first<{last_entry_id:string|null}>();
+  return row?.last_entry_id ?? null;
+}
+
+export async function setAuditCursor(env:Env,guildId:string,lastEntryId:string): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO audit_cursors(guild_id,last_entry_id,updated_at) VALUES (?,?,?)
+    ON CONFLICT(guild_id) DO UPDATE SET
+      last_entry_id=excluded.last_entry_id,
+      updated_at=excluded.updated_at
+  `).bind(guildId,lastEntryId,Date.now()).run();
+}
+
+// ── Amazon自販機 (CC-server) ──────────────────────────────────────────────────
+// amazon-vending.ts が使う DB 関数。CC-server の実装をそのまま移植。
 
 export type GuildConfig = Record<string, unknown> & { guild_id: string };
 
@@ -136,61 +589,6 @@ export async function getGuildConfig(env: Env, guildId: string): Promise<GuildCo
   await env.DB.prepare("INSERT INTO guild_config(guild_id) VALUES(?)").bind(guildId).run();
   return (await env.DB.prepare("SELECT * FROM guild_config WHERE guild_id=?").bind(guildId).first<GuildConfig>())!;
 }
-
-export async function updateGuildConfig(env: Env, guildId: string, fields: Record<string, unknown>): Promise<void> {
-  const keys = Object.keys(fields);
-  if (!keys.length) return;
-  await getGuildConfig(env, guildId);
-  const set = keys.map(k => `${k}=?`).join(",");
-  const vals = keys.map(k => fields[k]);
-  await env.DB.prepare(`UPDATE guild_config SET ${set} WHERE guild_id=?`).bind(...vals, guildId).run();
-}
-
-// ── panels ────────────────────────────────────────────────────────────────────
-
-export type Panel = { id: number; guild_id: string; title: string; description: string | null; message_id: string | null; channel_id: string | null; created_by: string; created_at: number };
-export type PanelButton = { id: number; panel_id: number; label: string; style: string; emoji: string | null; action_type: string; action_value: string };
-
-export async function listPanels(env: Env, guildId: string): Promise<Panel[]> {
-  const { results } = await env.DB.prepare("SELECT * FROM panels WHERE guild_id=? ORDER BY id").bind(guildId).all<Panel>();
-  return results;
-}
-
-export async function createPanel(env: Env, guildId: string, title: string, description: string | null): Promise<number> {
-  const r = await env.DB.prepare(
-    "INSERT INTO panels(guild_id,title,description,created_by,created_at) VALUES(?,?,?,'admin',?)"
-  ).bind(guildId, title, description, Date.now()).run();
-  return Number(r.meta.last_row_id);
-}
-
-export async function getPanel(env: Env, panelId: number, guildId: string): Promise<Panel | null> {
-  return env.DB.prepare("SELECT * FROM panels WHERE id=? AND guild_id=?").bind(panelId, guildId).first<Panel>();
-}
-
-export async function updatePanelPost(env: Env, panelId: number, messageId: string, channelId: string): Promise<void> {
-  await env.DB.prepare("UPDATE panels SET message_id=?,channel_id=? WHERE id=?").bind(messageId, channelId, panelId).run();
-}
-
-export async function listPanelButtons(env: Env, panelId: number): Promise<PanelButton[]> {
-  const { results } = await env.DB.prepare("SELECT * FROM panel_buttons WHERE panel_id=? ORDER BY id").bind(panelId).all<PanelButton>();
-  return results;
-}
-
-export async function createPanelButton(env: Env, panelId: number, label: string, style: string, emoji: string | null, actionType: string, actionValue: string): Promise<void> {
-  await env.DB.prepare(
-    "INSERT INTO panel_buttons(panel_id,label,style,emoji,action_type,action_value) VALUES(?,?,?,?,?,?)"
-  ).bind(panelId, label, style, emoji, actionType, actionValue).run();
-}
-
-export async function deletePanelButton(env: Env, buttonId: number, panelId: number): Promise<void> {
-  await env.DB.prepare("DELETE FROM panel_buttons WHERE id=? AND panel_id=?").bind(buttonId, panelId).run();
-}
-
-export async function getPanelButton(env: Env, buttonId: number): Promise<PanelButton | null> {
-  return env.DB.prepare("SELECT * FROM panel_buttons WHERE id=?").bind(buttonId).first<PanelButton>();
-}
-
-// ── amazon vending ────────────────────────────────────────────────────────────
 
 export type AvConfig = { guild_id: string; panel_title: string; panel_description: string | null; ltc_address: string | null; api_type: string; api_key: string | null };
 
@@ -238,49 +636,4 @@ export async function deleteAvSession(env: Env, id: string): Promise<void> {
 export async function cleanExpiredAvSessions(env: Env): Promise<void> {
   const cutoff = Date.now() - 30 * 60 * 1000;
   await env.DB.prepare("DELETE FROM amazon_vending_sessions WHERE created_at<?").bind(cutoff).run();
-}
-
-// ── bot guild cache ───────────────────────────────────────────────────────────
-// Discord's GET /users/@me/guilds is the only source of truth cc-server's
-// Worker has (no persistent gateway connection), but it can occasionally lag
-// right after an invite. Cache the last good result so a transient failure
-// doesn't empty the dashboard's server list.
-
-export type CachedBotGuild = { id: string; name: string; icon: string | null };
-
-export async function replaceBotGuildCache(env: Env, guilds: CachedBotGuild[]): Promise<void> {
-  const seenAt = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM bot_guild_cache"),
-    ...guilds.map(g => env.DB.prepare("INSERT INTO bot_guild_cache(guild_id,name,icon,seen_at) VALUES(?,?,?,?)").bind(g.id, g.name, g.icon, seenAt)),
-  ]);
-}
-
-export async function listBotGuildCache(env: Env, maxAgeMs = 24 * 60 * 60_000): Promise<CachedBotGuild[]> {
-  const { results } = await env.DB.prepare(
-    "SELECT guild_id AS id, name, icon FROM bot_guild_cache WHERE seen_at>=? ORDER BY name COLLATE NOCASE"
-  ).bind(Date.now() - maxAgeMs).all<CachedBotGuild>();
-  return results;
-}
-
-// ── external auths ───────────────────────────────────────────────────────────
-
-export type ExternalAuth = { id: string; name: string; url: string };
-
-export async function listExternalAuths(env: Env, guildId: string): Promise<ExternalAuth[]> {
-  const { results } = await env.DB.prepare(
-    "SELECT id, name, url FROM external_auths WHERE guild_id=? ORDER BY created_at"
-  ).bind(guildId).all<ExternalAuth>();
-  return results;
-}
-
-export async function insertExternalAuth(env: Env, row: { id: string; guild_id: string; name: string; url: string; created_at: number }): Promise<void> {
-  await env.DB.prepare(
-    "INSERT INTO external_auths(id,guild_id,name,url,created_at) VALUES(?,?,?,?,?)"
-  ).bind(row.id, row.guild_id, row.name, row.url, row.created_at).run();
-}
-
-export async function deleteExternalAuth(env: Env, id: string, guildId: string): Promise<boolean> {
-  const result = await env.DB.prepare("DELETE FROM external_auths WHERE id=? AND guild_id=?").bind(id, guildId).run();
-  return (result.meta.changes ?? 0) > 0;
 }

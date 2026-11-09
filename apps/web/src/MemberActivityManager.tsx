@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 
-type Channel = { id: string; name: string; type: number };
+type Channel = {
+  id: string;
+  name: string;
+  type?: "text" | "voice" | "announcement" | "stage" | "forum" | "media";
+  botCanPost?: boolean;
+};
 
 type MemberActivitySettings = {
   guildId: string;
@@ -23,53 +28,69 @@ type Props = {
 };
 
 const EMPTY: MemberActivitySettings = {
-  guildId: "", enabled: false, channelId: null, joinEnabled: true, leaveEnabled: true,
-  initialized: false, lastScanAt: null, memberCount: 0, lastError: null,
+  guildId: "",
+  enabled: false,
+  channelId: null,
+  joinEnabled: true,
+  leaveEnabled: true,
+  initialized: false,
+  lastScanAt: null,
+  memberCount: 0,
+  lastError: null
 };
 
 function formatScanTime(value: number | null): string {
   if (!value) return "まだ取得していません";
-  return new Date(value).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", hour12: false });
+  return new Date(value).toLocaleString("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    hour12: false
+  });
 }
 
-export default function MemberActivityManager({ guildId, channels, onNotice, onError }: Props) {
-  const [settings, setSettings] = useState<MemberActivitySettings>({ ...EMPTY, guildId });
+export default function MemberActivityManager({
+  guildId,
+  channels,
+  onNotice,
+  onError
+}: Props) {
+  const [settings, setSettings] = useState<MemberActivitySettings>({
+    ...EMPTY,
+    guildId
+  });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
-  const messageChannels = useMemo(() => channels.filter(c => c.type === 0 || c.type === 5), [channels]);
+  const messageChannels = useMemo(
+    () =>
+      channels.filter(
+        channel =>
+          channel.type === "text" || channel.type === "announcement"
+      ),
+    [channels]
+  );
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    void api<MemberActivitySettings>(`/api/guilds/${guildId}/member-activity`)
-      .then(data => { if (!cancelled) setSettings(data); })
-      .catch(reason => { if (!cancelled) onError(reason); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    void api<MemberActivitySettings>(
+      `/api/guilds/${guildId}/member-activity`
+    )
+      .then(data => {
+        if (cancelled) return;
+        setSettings(data);
+      })
+      .catch(reason => {
+        if (!cancelled) onError(reason);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
     // onError is intentionally omitted: App recreates the callback on render,
     // and depending on it would retry the same failed request in a render loop.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [guildId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const refreshStatus = async () => {
-      try {
-        const data = await api<MemberActivitySettings>(`/api/guilds/${guildId}/member-activity`, {}, 15_000);
-        if (cancelled) return;
-        setSettings(current => ({
-          ...current, initialized: data.initialized, lastScanAt: data.lastScanAt,
-          memberCount: data.memberCount, lastError: data.lastError,
-        }));
-      } catch {
-        // Initial load and explicit actions surface errors. Background status
-        // refresh stays quiet so a temporary network error does not spam UI.
-      }
-    };
-    const timer = window.setInterval(() => void refreshStatus(), 10_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
   }, [guildId]);
 
   function patch(next: Partial<MemberActivitySettings>) {
@@ -83,12 +104,25 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
     }
     setSaving(true);
     try {
-      const saved = await api<MemberActivitySettings>(`/api/guilds/${guildId}/member-activity`, {
-        method: "PUT",
-        body: JSON.stringify({ enabled: settings.enabled, channelId: settings.channelId, joinEnabled: settings.joinEnabled, leaveEnabled: settings.leaveEnabled }),
-      }, 60_000);
+      const saved = await api<MemberActivitySettings>(
+        `/api/guilds/${guildId}/member-activity`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled: settings.enabled,
+            channelId: settings.channelId,
+            joinEnabled: settings.joinEnabled,
+            leaveEnabled: settings.leaveEnabled
+          })
+        },
+        60_000
+      );
       setSettings(saved);
-      onNotice(saved.enabled ? "入退室通知を保存しました。初回メンバー情報も取得済みです" : "入退室通知をオフにしました");
+      onNotice(
+        saved.enabled
+          ? "入退室通知を保存しました。初回メンバー情報も取得済みです"
+          : "入退室通知をオフにしました"
+      );
     } catch (reason) {
       onError(reason);
     } finally {
@@ -103,7 +137,14 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
     }
     setTesting(true);
     try {
-      await api(`/api/guilds/${guildId}/member-activity/test`, { method: "POST", body: JSON.stringify({ channelId: settings.channelId }) }, 30_000);
+      await api(
+        `/api/guilds/${guildId}/member-activity/test`,
+        {
+          method: "POST",
+          body: JSON.stringify({ channelId: settings.channelId })
+        },
+        30_000
+      );
       onNotice("入室・退室のテスト通知を送信しました");
     } catch (reason) {
       onError(reason);
@@ -112,6 +153,10 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
     }
   }
 
+  const selectedChannel = messageChannels.find(
+    channel => channel.id === settings.channelId
+  );
+
   return (
     <div className="member-activity-manager">
       <article className="card member-activity-hero">
@@ -119,9 +164,17 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
           <div>
             <span className="eyebrow">MEMBER ACTIVITY</span>
             <h2>入室管理</h2>
-            <p className="muted">サーバーへの参加・退出を指定チャンネルへ通知します。</p>
+            <p className="muted">
+              サーバーへの参加・退出を指定チャンネルへ通知します。
+            </p>
           </div>
-          <span className={settings.enabled ? "member-activity-state on" : "member-activity-state"}>
+          <span
+            className={
+              settings.enabled
+                ? "member-activity-state on"
+                : "member-activity-state"
+            }
+          >
             {settings.enabled ? "通知 ON" : "通知 OFF"}
           </span>
         </div>
@@ -141,38 +194,74 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
           </div>
         </div>
 
-        {settings.lastError && <div className="panel-feedback error" role="status">最終取得エラー: {settings.lastError}</div>}
+        {settings.lastError && (
+          <div className="panel-feedback error" role="status">
+            最終取得エラー: {settings.lastError}
+          </div>
+        )}
 
         <div className="member-activity-config">
           <label className="member-activity-toggle">
             <div>
               <strong>入退室通知を有効化</strong>
-              <small>Discord Gatewayで入室・退室イベントをリアルタイム検知して通知します。</small>
+              <small>
+                入室・退室を通知します。VPSの中継が動いていれば即時、止まっていても1分ごとの確認で1〜2分以内に届きます。
+              </small>
             </div>
-            <input type="checkbox" checked={settings.enabled} onChange={e => patch({ enabled: e.target.checked })} />
+            <input
+              type="checkbox"
+              checked={settings.enabled}
+              onChange={event => patch({ enabled: event.target.checked })}
+            />
           </label>
 
           <label className="field">
             <span>通知先チャンネル</span>
-            <select value={settings.channelId ?? ""} onChange={e => patch({ channelId: e.target.value || null })}>
+            <select
+              value={settings.channelId ?? ""}
+              onChange={event =>
+                patch({ channelId: event.target.value || null })
+              }
+            >
               <option value="">チャンネルを選択</option>
-              {messageChannels.map(c => (
-                <option key={c.id} value={c.id}>#{c.name}</option>
+              {messageChannels.map(channel => (
+                <option
+                  key={channel.id}
+                  value={channel.id}
+                  disabled={channel.botCanPost === false}
+                >
+                  #{channel.name}
+                  {channel.botCanPost === false ? " — BOTアクセス不可" : ""}
+                </option>
               ))}
             </select>
-            <small>BOTに「チャンネルを見る・メッセージを送信・リンクを埋め込む」が必要です。</small>
+            <small>
+              BOTに「チャンネルを見る・メッセージを送信・リンクを埋め込む」が必要です。
+            </small>
           </label>
 
           <div className="member-activity-options">
             <label>
-              <input type="checkbox" checked={settings.joinEnabled} onChange={e => patch({ joinEnabled: e.target.checked })} />
+              <input
+                type="checkbox"
+                checked={settings.joinEnabled}
+                onChange={event =>
+                  patch({ joinEnabled: event.target.checked })
+                }
+              />
               <span>
                 <strong>入室通知</strong>
                 <small>緑色の通知を送信</small>
               </span>
             </label>
             <label>
-              <input type="checkbox" checked={settings.leaveEnabled} onChange={e => patch({ leaveEnabled: e.target.checked })} />
+              <input
+                type="checkbox"
+                checked={settings.leaveEnabled}
+                onChange={event =>
+                  patch({ leaveEnabled: event.target.checked })
+                }
+              />
               <span>
                 <strong>退室通知</strong>
                 <small>赤色の通知を送信</small>
@@ -182,14 +271,32 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
 
           <div className="member-activity-note">
             <strong>Server Members Intent が必要です</strong>
-            <span>Discord Developer Portal の Bot 設定で Server Members Intent を有効にしてください。無効な場合はメンバー一覧を取得できません。</span>
+            <span>
+              Discord Developer Portal の Bot 設定で Server Members Intent
+              を有効にしてください。無効な場合はメンバー一覧を取得できません。
+            </span>
           </div>
 
           <div className="button-row">
-            <button type="button" className="primary" onClick={() => void save()} disabled={loading || saving}>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void save()}
+              disabled={loading || saving}
+            >
               {saving ? "保存・初期化中..." : "設定を保存"}
             </button>
-            <button type="button" className="secondary" onClick={() => void testNotification()} disabled={loading || testing || !settings.channelId}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void testNotification()}
+              disabled={
+                loading ||
+                testing ||
+                !settings.channelId ||
+                selectedChannel?.botCanPost === false
+              }
+            >
               {testing ? "送信中..." : "通知テスト"}
             </button>
           </div>
@@ -205,7 +312,9 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
               <small>入室通知プレビュー</small>
             </div>
           </div>
-          <p><span className="mention">@ユーザー名</span> がサーバーに参加しました</p>
+          <p>
+            <span className="mention">@ユーザー名</span> がサーバーに参加しました
+          </p>
           <div className="member-activity-preview-field">
             <strong>🕰️ アカウント作成からの経過</strong>
             <span>2026-01-01 12:00:00 JST</span>
@@ -225,7 +334,9 @@ export default function MemberActivityManager({ guildId, channels, onNotice, onE
               <small>退室通知プレビュー</small>
             </div>
           </div>
-          <p><span className="mention">@ユーザー名</span> がサーバーから退出しました</p>
+          <p>
+            <span className="mention">@ユーザー名</span> がサーバーから退出しました
+          </p>
           <div className="member-activity-preview-field">
             <strong>🕰️ アカウント作成からの経過</strong>
             <span>2026-01-01 12:00:00 JST</span>

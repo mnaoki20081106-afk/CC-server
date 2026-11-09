@@ -1,10 +1,3 @@
-// Ported from xaccount-bot's apps/worker/src/security/types.ts.
-// cc-server has exactly one bot (no separate "Main Bot" vs "Security Bot"),
-// so MAIN_BOT_APPLICATION_ID / SECURITY_BRIDGE_SECRET / the cross-worker HMAC
-// bridge and the managed-service-bot registry are dropped — every place that
-// referenced the "Main Bot" identity now just uses DISCORD_APPLICATION_ID,
-// since it's the same bot.
-
 export type SecurityProfile = "balanced" | "strict" | "paranoid";
 export type EnforcementMode = "audit" | "enforce";
 
@@ -95,6 +88,17 @@ export type SecurityIncident = {
   createdAt: number;
 };
 
+export type MaintenanceScope = "dashboard_edit" | "restore";
+
+export interface Env {
+  DB: D1Database;
+  SECURITY_GATEWAY: DurableObjectNamespace;
+  DISCORD_BOT_TOKEN: string;
+  DISCORD_APPLICATION_ID: string;
+  MAIN_BOT_APPLICATION_ID?: string;
+  SECURITY_BRIDGE_SECRET: string;
+}
+
 export type GuildSafetyStatus = {
   explicitContentFilter: number;
   verificationLevel: number;
@@ -108,8 +112,13 @@ export type SecurityCapabilities = {
   administrator: boolean;
   requiredReady: boolean;
   maximumProtection: boolean;
+  roleAboveManagedBots: boolean | null;
   roleAboveDangerousRoles: boolean | null;
-  dangerousRolesNotBelow: Array<{ id: string; name: string; position: number }>;
+  dangerousRolesNotBelow: Array<{
+    id: string;
+    name: string;
+    position: number;
+  }>;
   highestRoleName: string | null;
   highestRolePosition: number | null;
   missingPermissions: string[];
@@ -122,11 +131,13 @@ export type GatewayStatus = {
   lastEventAt: number | null;
   reconnectAttempts: number;
   botUserId: string | null;
-  lastCloseCode: number | null;
-  lastCloseReason: string | null;
 };
 
-export type AuditLogChange = { key?: string; old_value?: unknown; new_value?: unknown };
+export type AuditLogChange = {
+  key?: string;
+  old_value?: unknown;
+  new_value?: unknown;
+};
 
 export type AuditEntry = {
   id: string;
@@ -143,8 +154,14 @@ export type DiscordMessageEvent = {
   id: string;
   guild_id?: string;
   channel_id: string;
-  author: { id: string; bot?: boolean; username?: string };
-  member?: { roles?: string[] };
+  author: {
+    id: string;
+    bot?: boolean;
+    username?: string;
+  };
+  member?: {
+    roles?: string[];
+  };
   content?: string;
   mentions?: Array<{ id: string }>;
   mention_roles?: string[];
@@ -159,6 +176,10 @@ export type DiscordMessageEvent = {
 
 export type DiscordMemberAddEvent = {
   guild_id: string;
-  user: { id: string; bot?: boolean; username?: string };
+  user: {
+    id: string;
+    bot?: boolean;
+    username?: string;
+  };
   roles?: string[];
 };

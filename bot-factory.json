@@ -12,7 +12,7 @@
   ],
   "setup": {
     "title": "CC-Server",
-    "description": "Discordサーバー管理BOT。管理サイト（GitHub Pages）とAmazon自販機をCloudflare Workerで運用します。初回デプロイ後にDiscord Developer PortalでInteractions Endpoint URLを設定してください。",
+    "description": "Discordサーバー管理BOT(Discord-Bot + Discord-Security 統合)。サーバー管理はすべて管理サイト(GitHub Pages)から行います。Amazon自販機も同じWorkerで動きます。初回デプロイ後にDiscord Developer PortalでInteractions Endpoint URLとOAuth2 Redirectを設定してください。",
     "fields": [
       {
         "key": "DISCORD_BOT_TOKEN",
@@ -64,12 +64,40 @@
         }
       },
       {
+        "key": "DISCORD_CLIENT_SECRET",
+        "label": "Client Secret",
+        "type": "secret",
+        "required": true,
+        "source": {
+          "title": "Client Secretの取得方法",
+          "steps": [
+            "Discord Developer PortalでCC-Server用Applicationを開く",
+            "左メニューのOAuth2を開く",
+            "Client SecretのReset Secretを押して値をコピーする"
+          ],
+          "url": "https://discord.com/developers/applications",
+          "link_label": "Discord Developer Portalを開く ↗"
+        },
+        "help": "認証パネル(Discord OAuth2認証)とバックアップ用メンバー復旧に使用します。"
+      },
+      {
         "key": "DASHBOARD_PASSWORD",
         "label": "管理サイト Password",
         "type": "secret",
         "required": true,
         "placeholder": "好きなパスワード",
         "help": "GitHub Pagesの管理画面へログインするためのパスワードです。自分で分かる値を設定してください。"
+      },
+      {
+        "key": "SESSION_ENCRYPTION_KEY",
+        "label": "暗号化キー",
+        "type": "secret",
+        "required": true,
+        "generate": {
+          "strategy": "hex",
+          "bytes": 32
+        },
+        "help": "OAuthトークン・バックアップ・決済アカウント情報の暗号化に使います。Factoryが自動生成します。"
       },
       {
         "key": "GOOGLE_PLACES_API_KEY",
@@ -87,6 +115,21 @@
           "link_label": "Google Cloud Consoleを開く ↗"
         },
         "help": "Amazon自販機でローソン店舗の実在確認に使用します。Google Cloud ConsoleでPlaces API（New）を有効にしたAPIキーを設定してください。"
+      },
+      {
+        "key": "SECURITY_DISCORD_BOT_TOKEN",
+        "label": "Security専用 BOT Token(任意)",
+        "type": "secret",
+        "required": false,
+        "help": "Discord-Securityを別のBotアカウントで動かす場合だけ設定します。未設定ならメインBOTがセキュリティ機能も担当します。"
+      },
+      {
+        "key": "SECURITY_DISCORD_APPLICATION_ID",
+        "label": "Security専用 Application ID(任意)",
+        "type": "text",
+        "required": false,
+        "pattern": "^\\d{17,20}$",
+        "help": "Security専用BOT Tokenを設定した場合、そのApplication IDを入力します。"
       }
     ],
     "discord": {
@@ -95,7 +138,7 @@
           "id": "server-members-intent",
           "label": "Server Members Intent",
           "required": true,
-          "description": "入退室検知に必要です。",
+          "description": "入退室通知・Anti-Raid・メンバー監視に必要です。",
           "path": "Discord Developer Portal > Bot > Privileged Gateway Intents",
           "url": "https://discord.com/developers/applications"
         },
@@ -103,7 +146,7 @@
           "id": "message-content-intent",
           "label": "Message Content Intent",
           "required": true,
-          "description": "Anti-Spam・危険リンク判定に必要です。",
+          "description": "Anti-Spam・フィッシング/危険ファイル判定(Discord-Security)に必要です。",
           "path": "Discord Developer Portal > Bot > Privileged Gateway Intents",
           "url": "https://discord.com/developers/applications"
         }
@@ -115,6 +158,14 @@
           "required": false,
           "description": "Factoryの初回デプロイ完了後に発行されたWorkerのHTTPS URLを使い、Discord Developer Portal > General Information > Interactions Endpoint URLへ「https://<Worker URL>/interactions」を設定してSave Changesします。ボタン・モーダル操作を受けるために必要です。",
           "path": "Discord Developer Portal > General Information > Interactions Endpoint URL",
+          "url": "https://discord.com/developers/applications"
+        },
+        {
+          "id": "post-deploy-oauth-redirect",
+          "label": "初回デプロイ後: OAuth2 Redirectを設定",
+          "required": false,
+          "description": "Discord Developer Portal > OAuth2 > Redirects に「https://<Worker URL>/auth/discord/callback」を追加します。wrangler.jsonc の DISCORD_OAUTH_REDIRECT_URI と完全一致させてください。認証パネルに必要です。",
+          "path": "Discord Developer Portal > OAuth2 > Redirects",
           "url": "https://discord.com/developers/applications"
         }
       ]

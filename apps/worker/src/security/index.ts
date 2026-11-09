@@ -1,0 +1,573 @@
+import {
+  cleanExpired,
+  consumeBridgeNonce,
+  createMaintenanceLease,
+  ensureSchema,
+  getLockdownSnapshot,
+  getSecuritySettings,
+  listExpiredLockdowns,
+  listIncidents,
+  listManagedServiceBots,
+  registerManagedServiceBot,
+  saveSecuritySettings
+} from "./db";
+import {
+  botJson,
+  enterLockdown,
+  exitLockdown,
+  getGuildSafetyStatus,
+  getSecurityCapabilities,
+  repairManagedBotChannelAccess
+} from "./discord";
+import {
+  DiscordSecurityGateway,
+  ensureDiscordSecurityGateway,
+  gatewayStatus,
+  reconcileDiscordSecurityAudits
+} from "./gateway";
+import type {
+  Env,
+  MaintenanceScope,
+  SecuritySettings
+} from "./types";
+
+export { DiscordSecurityGateway };
+
+function json(data: unknown, status = 200): Response {
+  return Response.json(data, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff"
+    }
+  });
+}
+
+export function isConfiguredMainBot(
+  env: Pick<Env, "MAIN_BOT_APPLICATION_ID">,
+  candidateId: string
+): boolean {
+  const expected = String(env.MAIN_BOT_APPLICATION_ID ?? "").trim();
+  return /^\d+$/.test(expected) && candidateId === expected;
+}
+
+
+function hex(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)]
+    .map(value => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hmacHex(secret: string, value: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return hex(await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(value)
+  ));
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let index = 0; index < a.length; index++) {
+    diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
+  }
+  return diff === 0;
+}
+
+async function verifyBridge(
+  request: Request,
+  env: Env,
+  body: string
+): Promise<boolean> {
+  if (!env.SECURITY_BRIDGE_SECRET || env.SECURITY_BRIDGE_SECRET.length < 32) {
+    return false;
+  }
+  const timestamp = request.headers.get("X-Security-Timestamp") ?? "";
+  const nonce = request.headers.get("X-Security-Nonce") ?? "";
+  const signature = request.headers.get("X-Security-Signature") ?? "";
+  if (
+    !/^\d+$/.test(timestamp) ||
+    !/^[a-zA-Z0-9_-]{16,128}$/.test(nonce) ||
+    !/^[a-f0-9]{64}$/i.test(signature)
+  ) return false;
+  const numeric = Number(timestamp);
+  if (!Number.isFinite(numeric) || Math.abs(Date.now() - numeric) > 60_000) {
+    return false;
+  }
+  const url = new URL(request.url);
+  const canonical =
+    timestamp + "\n" +
+    nonce + "\n" +
+    request.method.toUpperCase() + "\n" +
+    url.pathname + url.search + "\n" +
+    body;
+  const expected = await hmacHex(env.SECURITY_BRIDGE_SECRET, canonical);
+  if (!safeEqual(expected, signature.toLowerCase())) return false;
+  return consumeBridgeNonce(env, nonce, Date.now() + 2 * 60_000);
+}
+
+async function invalidateGatewaySettings(env: Env, guildId: string): Promise<void> {
+  const id = env.SECURITY_GATEWAY.idFromName("discord-security");
+  await env.SECURITY_GATEWAY.get(id).fetch(
+    "https://security-gateway.internal/invalidate/" + encodeURIComponent(guildId),
+    { method: "POST" }
+  ).catch(() => undefined);
+}
+
+function settingsPatch(body: unknown): Partial<SecuritySettings> {
+  if (!body || typeof body !== "object") return {};
+  const input = body as Partial<SecuritySettings>;
+  const patch: Partial<SecuritySettings> = {};
+  if (typeof input.enabled === "boolean") patch.enabled = input.enabled;
+  if (input.mode === "audit" || input.mode === "enforce") patch.mode = input.mode;
+  if (["balanced", "strict", "paranoid"].includes(String(input.profile))) {
+    patch.profile = input.profile;
+  }
+  if (input.modules && typeof input.modules === "object") patch.modules = input.modules;
+  if (input.response && typeof input.response === "object") patch.response = input.response;
+  if (input.safety && typeof input.safety === "object") {
+    const raw = input.safety as Partial<SecuritySettings["safety"]>;
+    patch.safety = {
+      enforceExplicitContentFilter:
+        typeof raw.enforceExplicitContentFilter === "boolean"
+          ? raw.enforceExplicitContentFilter
+          : true,
+      minimumVerificationLevel: Math.max(
+        0,
+        Math.min(4, Math.trunc(Number(raw.minimumVerificationLevel ?? 2)))
+      )
+    };
+  }
+  if (input.thresholds && typeof input.thresholds === "object") {
+    const limits: Record<string, [number, number]> = {
+      actionWindowSeconds: [2, 120],
+      crossActionWindowSeconds: [5, 300],
+      crossActionScore: [4, 100],
+      channelDelete: [1, 30],
+      channelCreate: [1, 50],
+      channelUpdate: [1, 50],
+      channelOverwrite: [1, 50],
+      roleDelete: [1, 30],
+      roleCreate: [1, 50],
+      roleUpdate: [1, 50],
+      banAdd: [1, 50],
+      memberPrune: [1, 100000],
+      kick: [1, 50],
+      webhook: [1, 30],
+      botAdd: [1, 10],
+      guildUpdate: [1, 20],
+      automodChange: [1, 20],
+      raidJoins: [2, 1000],
+      raidWindowSeconds: [2, 300],
+      spamMessages: [2, 50],
+      spamWindowSeconds: [1, 120],
+      mentionLimit: [2, 100],
+      linkBurst: [2, 50],
+      linkWindowSeconds: [2, 300],
+      severeContentUsers: [2, 50],
+      severeContentWindowSeconds: [5, 300],
+      minAccountAgeHours: [0, 87600]
+    };
+    const normalized: Record<string, number> = {};
+    for (const [key, range] of Object.entries(limits)) {
+      const value = Number((input.thresholds as unknown as Record<string, unknown>)[key]);
+      if (!Number.isFinite(value)) continue;
+      normalized[key] = Math.max(range[0], Math.min(range[1], Math.trunc(value)));
+    }
+    patch.thresholds = normalized as Partial<SecuritySettings["thresholds"]> as SecuritySettings["thresholds"];
+  }
+  for (const key of [
+    "trustedUserIds",
+    "trustedRoleIds",
+    "allowedBotIds",
+    "allowedDomains",
+    "blockedDomains"
+  ] as const) {
+    const value = input[key];
+    if (Array.isArray(value)) {
+      (patch as Record<string, unknown>)[key] = value
+        .map(item => String(item).trim())
+        .filter(Boolean)
+        .slice(0, 500);
+    }
+  }
+  if (input.logChannelId === null || typeof input.logChannelId === "string") {
+    patch.logChannelId = input.logChannelId || null;
+  }
+  return patch;
+}
+
+const BRIDGE_LOCKED_MODULES: Array<keyof SecuritySettings["modules"]> = [
+  "antiNuke",
+  "antiRaid",
+  "antiPhishing",
+  "dangerousAttachments",
+  "botGuard",
+  "webhookGuard",
+  "roleGuard",
+  "permissionGuard",
+  "automodGuard",
+  "guildGuard",
+  "memberGuard"
+];
+
+function retainExistingOnly(current: string[], requested: string[] | undefined): string[] {
+  if (!requested) return current;
+  const keep = new Set(requested);
+  return current.filter(value => keep.has(value));
+}
+
+export function applyBridgeSecurityFloor(
+  current: SecuritySettings,
+  requested: Partial<SecuritySettings>
+): Partial<SecuritySettings> {
+  const modules = {
+    ...current.modules,
+    ...(requested.modules ?? {})
+  };
+  for (const key of BRIDGE_LOCKED_MODULES) modules[key] = true;
+
+  const response = {
+    ...current.response,
+    ...(requested.response ?? {}),
+    stripDangerousRoles: true,
+    kickMaliciousBots: true,
+    autoLockdown: true,
+    deleteUnsafeMessages: true,
+    quarantineRaidJoins: true
+  };
+
+  const safety = {
+    ...current.safety,
+    ...(requested.safety ?? {}),
+    enforceExplicitContentFilter: true,
+    minimumVerificationLevel: Math.max(
+      2,
+      Number(requested.safety?.minimumVerificationLevel ??
+        current.safety.minimumVerificationLevel)
+    )
+  };
+
+  const thresholds = {
+    ...current.thresholds,
+    ...(requested.thresholds ?? {})
+  };
+  // Main may tune sensitivity, but cannot stretch the critical thresholds far
+  // enough to effectively disable the independent Security Worker.
+  thresholds.crossActionScore = Math.min(thresholds.crossActionScore, 20);
+  thresholds.channelDelete = Math.min(thresholds.channelDelete, 3);
+  thresholds.channelOverwrite = Math.min(thresholds.channelOverwrite, 6);
+  thresholds.roleDelete = Math.min(thresholds.roleDelete, 3);
+  thresholds.banAdd = Math.min(thresholds.banAdd, 10);
+  thresholds.memberPrune = Math.min(thresholds.memberPrune, 25);
+  thresholds.kick = Math.min(thresholds.kick, 10);
+  thresholds.webhook = Math.min(thresholds.webhook, 3);
+  thresholds.botAdd = 1;
+  thresholds.guildUpdate = Math.min(thresholds.guildUpdate, 3);
+  thresholds.automodChange = 1;
+  thresholds.raidJoins = Math.min(thresholds.raidJoins, 20);
+  thresholds.severeContentUsers = Math.min(thresholds.severeContentUsers, 6);
+  thresholds.actionWindowSeconds = Math.max(thresholds.actionWindowSeconds, 8);
+  thresholds.crossActionWindowSeconds = Math.max(
+    thresholds.crossActionWindowSeconds,
+    20
+  );
+  thresholds.raidWindowSeconds = Math.max(thresholds.raidWindowSeconds, 8);
+  thresholds.severeContentWindowSeconds = Math.max(
+    thresholds.severeContentWindowSeconds,
+    20
+  );
+
+  return {
+    ...requested,
+    enabled: true,
+    mode: "enforce",
+    modules,
+    response,
+    safety,
+    thresholds,
+    // Permanent actor/bot/domain bypasses must not be creatable by a Worker
+    // holding only the Main bridge secret. Existing exceptions can be removed.
+    trustedUserIds: retainExistingOnly(
+      current.trustedUserIds,
+      requested.trustedUserIds
+    ),
+    trustedRoleIds: retainExistingOnly(
+      current.trustedRoleIds,
+      requested.trustedRoleIds
+    ),
+    allowedBotIds: retainExistingOnly(
+      current.allowedBotIds,
+      requested.allowedBotIds
+    ),
+    allowedDomains: retainExistingOnly(
+      current.allowedDomains,
+      requested.allowedDomains
+    )
+  };
+}
+
+export function isManualDashboardLockdown(reason: string | null | undefined): boolean {
+  return reason === "manual dashboard lockdown";
+}
+
+async function handleInternal(
+  request: Request,
+  env: Env,
+  bodyText: string
+): Promise<Response> {
+  const url = new URL(request.url);
+  const overview = url.pathname.match(/^\/internal\/guilds\/(\d+)\/overview$/);
+  if (overview && request.method === "GET") {
+    const guildId = overview[1]!;
+    const managedServiceBots = await listManagedServiceBots(env, guildId);
+    const managedBotIds = [
+      ...managedServiceBots.map(item => item.botId),
+      ...(env.MAIN_BOT_APPLICATION_ID?.trim() ? [env.MAIN_BOT_APPLICATION_ID.trim()] : [])
+    ].filter((id, index, all) => all.indexOf(id) === index);
+    const settings = await getSecuritySettings(env, guildId);
+    const [status, incidents, lockdown, guild, capabilities, safetyStatus] = await Promise.all([
+      gatewayStatus(env),
+      listIncidents(env, guildId, Number(url.searchParams.get("limit") ?? 30)),
+      getLockdownSnapshot(env, guildId),
+      botJson<{ id: string; name: string }>(env, `/guilds/${guildId}`).catch(() => null),
+      getSecurityCapabilities(
+        env,
+        guildId,
+        managedBotIds
+      ),
+      getGuildSafetyStatus(env, guildId, settings).catch(() => null)
+    ]);
+    const permissions = (
+      128n | 32n | 268435456n | 16n | 536870912n | 8192n |
+      1099511627776n | 2n | 4n | 1024n | 2048n | 16384n
+    ).toString();
+    return json({
+      configured: true,
+      installed: Boolean(guild),
+      managedServiceBots,
+      mainBotApplicationIdConfigured: Boolean(env.MAIN_BOT_APPLICATION_ID?.trim()),
+      capabilities,
+      safetyStatus,
+      inviteUrl:
+        `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(env.DISCORD_APPLICATION_ID)}` +
+        `&permissions=${permissions}&integration_type=0&scope=bot%20applications.commands`,
+      maximumInviteUrl:
+        `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(env.DISCORD_APPLICATION_ID)}` +
+        `&permissions=8&integration_type=0&scope=bot%20applications.commands`,
+      settings,
+      status,
+      incidents,
+      bridgeProtection: {
+        coreLocked: true,
+        exceptionAdditionsLocked: true,
+        automaticLockdownUnlockLocked: true
+      },
+      lockdown: lockdown
+        ? {
+            active: true,
+            expiresAt: lockdown.expiresAt,
+            reason: lockdown.reason,
+            manualUnlockAllowed: isManualDashboardLockdown(lockdown.reason)
+          }
+        : {
+            active: false,
+            expiresAt: null,
+            reason: null,
+            manualUnlockAllowed: false
+          }
+    });
+  }
+
+  const serviceBots = url.pathname.match(/^\/internal\/guilds\/(\d+)\/service-bots$/);
+  if (serviceBots && request.method === "POST") {
+    const body = bodyText ? JSON.parse(bodyText) as { botId?: string; kind?: string } : {};
+    const botId = String(body.botId ?? "");
+    if (!/^\d+$/.test(botId)) return json({ error: "invalid_bot_id" }, 400);
+    if (!env.MAIN_BOT_APPLICATION_ID?.trim()) {
+      return json({ error: "main_bot_not_configured" }, 503);
+    }
+    if (!isConfiguredMainBot(env, botId)) {
+      return json({ error: "service_bot_not_allowed" }, 403);
+    }
+    await registerManagedServiceBot(
+      env,
+      serviceBots[1]!,
+      botId,
+      "main"
+    );
+    return json({ ok: true }, 201);
+  }
+
+  const settingsMatch = url.pathname.match(/^\/internal\/guilds\/(\d+)\/settings$/);
+  if (settingsMatch && request.method === "GET") {
+    return json(await getSecuritySettings(env, settingsMatch[1]!));
+  }
+  if (settingsMatch && request.method === "PUT") {
+    const body = bodyText ? JSON.parse(bodyText) : {};
+    const guildId = settingsMatch[1]!;
+    const current = await getSecuritySettings(env, guildId);
+    const saved = await saveSecuritySettings(
+      env,
+      guildId,
+      applyBridgeSecurityFloor(current, settingsPatch(body))
+    );
+    await invalidateGatewaySettings(env, guildId);
+    return json(saved);
+  }
+
+  const maintenance = url.pathname.match(
+    /^\/internal\/guilds\/(\d+)\/maintenance$/
+  );
+  if (maintenance && request.method === "POST") {
+    const body = bodyText ? JSON.parse(bodyText) as {
+      actorId?: string;
+      scope?: MaintenanceScope;
+      seconds?: number;
+    } : {};
+    const actorId = String(body.actorId ?? "");
+    const scope = body.scope;
+    if (!/^\d+$/.test(actorId)) return json({ error: "invalid_actor" }, 400);
+    if (!env.MAIN_BOT_APPLICATION_ID?.trim()) {
+      return json({ error: "main_bot_not_configured" }, 503);
+    }
+    if (!isConfiguredMainBot(env, actorId)) {
+      return json({ error: "maintenance_actor_not_allowed" }, 403);
+    }
+    if (!["dashboard_edit", "restore"].includes(String(scope))) {
+      return json({ error: "invalid_scope" }, 400);
+    }
+    return json(await createMaintenanceLease(
+      env,
+      maintenance[1]!,
+      actorId,
+      scope as MaintenanceScope,
+      Number(body.seconds ?? 30)
+    ), 201);
+  }
+
+  const mainBotChannelRepair = url.pathname.match(
+    /^\/internal\/guilds\/(\d+)\/main-bot\/channels\/(\d+)\/access$/
+  );
+  if (mainBotChannelRepair && request.method === "POST") {
+    const mainBotId = String(env.MAIN_BOT_APPLICATION_ID ?? "").trim();
+    if (!/^\d+$/.test(mainBotId)) {
+      return json({ error: "main_bot_not_configured" }, 503);
+    }
+    const result = await repairManagedBotChannelAccess(
+      env,
+      mainBotChannelRepair[1]!,
+      mainBotId,
+      mainBotChannelRepair[2]!
+    );
+    return json({ ok: true, ...result });
+  }
+
+  const lockdown = url.pathname.match(
+    /^\/internal\/guilds\/(\d+)\/lockdown$/
+  );
+  if (lockdown && request.method === "POST") {
+    const settings = await getSecuritySettings(env, lockdown[1]!);
+    const body = bodyText ? JSON.parse(bodyText) as {
+      minutes?: number;
+    } : {};
+    const changed = await enterLockdown(
+      env,
+      lockdown[1]!,
+      Number(body.minutes ?? settings.response.lockdownMinutes),
+      "manual dashboard lockdown"
+    );
+    return json({ ok: true, changed });
+  }
+  if (lockdown && request.method === "DELETE") {
+    const snapshot = await getLockdownSnapshot(env, lockdown[1]!);
+    if (snapshot && !isManualDashboardLockdown(snapshot.reason)) {
+      return json({
+        error: "automatic_lockdown_protected",
+        message:
+          "自動防御で発動したLockdownはMain Botから解除できません。期限切れの自動復旧を待つか、Security Worker側で対応してください。",
+        expiresAt: snapshot.expiresAt
+      }, 409);
+    }
+    return json({
+      ok: true,
+      changed: await exitLockdown(env, lockdown[1]!)
+    });
+  }
+
+  return json({ error: "not_found" }, 404);
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/" || url.pathname === "/health") {
+      const status = await gatewayStatus(env);
+      return json({
+        ok: true,
+        service: "discord-security",
+        version: "bot-coexistence-v72",
+        gateway: {
+          connected: status.connected,
+          lastHeartbeatAck: status.lastHeartbeatAck,
+          lastEventAt: status.lastEventAt,
+          reconnectAttempts: status.reconnectAttempts
+        }
+      });
+    }
+
+    if (!url.pathname.startsWith("/internal/")) {
+      return json({ error: "not_found" }, 404);
+    }
+
+    const bodyText = request.method === "GET" ? "" : await request.text();
+    if (!(await verifyBridge(request, env, bodyText))) {
+      return json({ error: "unauthorized" }, 401);
+    }
+
+    await ensureSchema(env);
+    ctx.waitUntil(ensureDiscordSecurityGateway(env));
+    try {
+      return await handleInternal(request, env, bodyText);
+    } catch (error) {
+      console.error("internal security API failed", error);
+      return json({
+        error: "server_error",
+        message: error instanceof Error ? error.message : "unknown error"
+      }, 500);
+    }
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    await ensureSchema(env);
+    ctx.waitUntil((async () => {
+      await cleanExpired(env);
+      await ensureDiscordSecurityGateway(env);
+      await reconcileDiscordSecurityAudits(env).catch(error => {
+        console.error("scheduled audit reconciliation failed", error);
+      });
+      for (const guildId of await listExpiredLockdowns(env)) {
+        await exitLockdown(env, guildId).catch(error => {
+          console.error("lockdown restore failed", guildId, error);
+        });
+      }
+    })());
+  }
+} satisfies ExportedHandler<Env>;

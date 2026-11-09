@@ -5,3 +5,6 @@ data/
 *.sqlite
 *.log
 *.tsbuildinfo
+.worker-dist/
+.test-worker/
+.wrangler/

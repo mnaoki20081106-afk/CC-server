@@ -1,28 +1,56 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
-import Field from "./Field";
 
-type Channel = { id: string; name: string; type: number; parent_id: string | null };
+type Channel = {
+  id: string;
+  name: string;
+  type?: "text" | "voice" | "announcement" | "stage" | "forum" | "media";
+  botCanPost?: boolean;
+};
 
 type SecurityModules = {
-  antiNuke: boolean; antiRaid: boolean; antiSpam: boolean; antiPhishing: boolean;
-  dangerousAttachments: boolean; botGuard: boolean; webhookGuard: boolean; roleGuard: boolean;
-  permissionGuard: boolean; automodGuard: boolean; guildGuard: boolean; memberGuard: boolean;
+  antiNuke: boolean;
+  antiRaid: boolean;
+  antiSpam: boolean;
+  antiPhishing: boolean;
+  dangerousAttachments: boolean;
+  botGuard: boolean;
+  webhookGuard: boolean;
+  roleGuard: boolean;
+  permissionGuard: boolean;
+  automodGuard: boolean;
+  guildGuard: boolean;
+  memberGuard: boolean;
 };
 
-type SecurityThresholds = {
-  actionWindowSeconds: number; crossActionWindowSeconds: number; crossActionScore: number;
-  channelDelete: number; channelCreate: number; channelUpdate: number; channelOverwrite: number;
-  roleDelete: number; roleCreate: number; roleUpdate: number; banAdd: number; memberPrune: number;
-  kick: number; webhook: number; botAdd: number; guildUpdate: number; automodChange: number;
-  raidJoins: number; raidWindowSeconds: number; spamMessages: number; spamWindowSeconds: number;
-  mentionLimit: number; linkBurst: number; linkWindowSeconds: number; severeContentUsers: number;
-  severeContentWindowSeconds: number; minAccountAgeHours: number;
-};
-
-type SecurityResponseConfig = {
-  stripDangerousRoles: boolean; kickMaliciousBots: boolean; timeoutMinutes: number;
-  autoLockdown: boolean; lockdownMinutes: number; deleteUnsafeMessages: boolean; quarantineRaidJoins: boolean;
+type Thresholds = {
+  actionWindowSeconds: number;
+  crossActionWindowSeconds: number;
+  crossActionScore: number;
+  channelDelete: number;
+  channelCreate: number;
+  channelUpdate: number;
+  channelOverwrite: number;
+  roleDelete: number;
+  roleCreate: number;
+  roleUpdate: number;
+  banAdd: number;
+  memberPrune: number;
+  kick: number;
+  webhook: number;
+  botAdd: number;
+  guildUpdate: number;
+  automodChange: number;
+  raidJoins: number;
+  raidWindowSeconds: number;
+  spamMessages: number;
+  spamWindowSeconds: number;
+  mentionLimit: number;
+  linkBurst: number;
+  linkWindowSeconds: number;
+  severeContentUsers: number;
+  severeContentWindowSeconds: number;
+  minAccountAgeHours: number;
 };
 
 type SecuritySettings = {
@@ -30,9 +58,20 @@ type SecuritySettings = {
   mode: "audit" | "enforce";
   profile: "balanced" | "strict" | "paranoid";
   modules: SecurityModules;
-  thresholds: SecurityThresholds;
-  response: SecurityResponseConfig;
-  safety: { enforceExplicitContentFilter: boolean; minimumVerificationLevel: number };
+  thresholds: Thresholds;
+  response: {
+    stripDangerousRoles: boolean;
+    kickMaliciousBots: boolean;
+    timeoutMinutes: number;
+    autoLockdown: boolean;
+    lockdownMinutes: number;
+    deleteUnsafeMessages: boolean;
+    quarantineRaidJoins: boolean;
+  };
+  safety: {
+    enforceExplicitContentFilter: boolean;
+    minimumVerificationLevel: number;
+  };
   logChannelId: string | null;
   trustedUserIds: string[];
   trustedRoleIds: string[];
@@ -41,43 +80,78 @@ type SecuritySettings = {
   blockedDomains: string[];
 };
 
-type SecurityIncident = { id: string; actorId: string | null; kind: string; severity: string; summary: string; createdAt: number };
-
-type GuildSafetyStatus = {
-  explicitContentFilter: number;
-  verificationLevel: number;
-  mfaLevel: number;
-  raidAlertsEnabled: boolean;
-  safetyAlertsChannelConfigured: boolean;
-  baselineReady: boolean;
+type Overview = {
+  configured: boolean;
+  installed?: boolean;
+  inviteUrl?: string;
+  maximumInviteUrl?: string;
+  capabilities?: {
+    administrator: boolean;
+    requiredReady: boolean;
+    maximumProtection: boolean;
+    roleAboveManagedBots: boolean | null;
+    roleAboveDangerousRoles: boolean | null;
+    dangerousRolesNotBelow: Array<{
+      id: string;
+      name: string;
+      position: number;
+    }>;
+    highestRoleName: string | null;
+    highestRolePosition: number | null;
+    missingPermissions: string[];
+  };
+  safetyStatus?: {
+    explicitContentFilter: number;
+    verificationLevel: number;
+    mfaLevel: number;
+    raidAlertsEnabled: boolean;
+    safetyAlertsChannelConfigured: boolean;
+    baselineReady: boolean;
+  } | null;
+  bridgeProtection?: {
+    coreLocked: boolean;
+    exceptionAdditionsLocked: boolean;
+    automaticLockdownUnlockLocked: boolean;
+  };
+  unreachable?: boolean;
+  message?: string;
+  settings: SecuritySettings | null;
+  status: {
+    connected: boolean;
+    lastHeartbeatAck: number | null;
+    lastEventAt: number | null;
+    reconnectAttempts: number;
+    botUserId: string | null;
+  };
+  incidents: Array<{
+    id: string;
+    actorId: string | null;
+    kind: string;
+    severity: string;
+    summary: string;
+    createdAt: number;
+  }>;
+  lockdown: {
+    active: boolean;
+    expiresAt: number | null;
+    reason: string | null;
+    manualUnlockAllowed?: boolean;
+  };
 };
 
-type SecurityOverview = {
-  settings: SecuritySettings;
-  status: { connected: boolean; lastEventAt: number | null; reconnectAttempts: number };
-  incidents: SecurityIncident[];
-  lockdown: { active: boolean; expiresAt: number | null; reason: string | null; manualUnlockAllowed: boolean };
-  capabilities: { administrator: boolean; requiredReady: boolean; missingPermissions: string[] };
-  maximumInviteUrl: string;
-  safetyStatus: GuildSafetyStatus | null;
-};
-
-const MODULE_LABELS: Record<keyof SecurityModules, [string, string]> = {
-  antiNuke: ["Anti-Nuke", "チャンネル/ロールの大量削除を検知し自動で封じ込めます"],
-  antiRaid: ["Anti-Raid", "短時間の大量参加を検知します"],
-  antiSpam: ["Anti-Spam", "短時間の連投・大量メンションを検知します"],
-  antiPhishing: ["Anti-Phishing", "フィッシングURL・不審リンクを検知します"],
-  dangerousAttachments: ["危険な添付ファイル", "実行可能ファイルの添付を検知します"],
-  botGuard: ["Bot Guard", "危険な権限を持つBotの追加を検知します"],
-  webhookGuard: ["Webhook Guard", "不審なWebhook作成を検知し削除します"],
-  roleGuard: ["Role Guard", "ロールの大量作成・削除を検知します"],
-  permissionGuard: ["Permission Guard", "権限昇格・チャンネル権限の不審な変更を検知します"],
-  automodGuard: ["AutoMod Guard", "サーバーのAutoMod設定変更を検知します"],
-  guildGuard: ["Guild Guard", "サーバー設定自体の不審な変更を検知します"],
-  memberGuard: ["Member Guard", "大量Kick/BAN/メンバー削除を検知します"],
-};
-
-function Toggle({ value, onChange, title, description, disabled = false }: { value: boolean; onChange: (value: boolean) => void; title: string; description: string; disabled?: boolean }) {
+function Toggle({
+  value,
+  onChange,
+  title,
+  description,
+  disabled = false
+}: {
+  value: boolean;
+  onChange: (value: boolean) => void;
+  title: string;
+  description: string;
+  disabled?: boolean;
+}) {
   return (
     <label className={`toggle-row ${disabled ? "disabled" : ""}`}>
       <span className="toggle-copy">
@@ -85,221 +159,541 @@ function Toggle({ value, onChange, title, description, disabled = false }: { val
         <small>{description}</small>
       </span>
       <span className={`switch ${value ? "on" : ""}`}>
-        <input type="checkbox" checked={value} disabled={disabled} onChange={event => onChange(event.target.checked)} />
+        <input
+          type="checkbox"
+          checked={value}
+          disabled={disabled}
+          onChange={event => onChange(event.target.checked)}
+        />
         <span />
       </span>
     </label>
   );
 }
 
-function severityColor(severity: string): string {
-  if (severity === "critical") return "bad";
-  if (severity === "high") return "bad";
-  if (severity === "medium") return "warn";
-  return "good";
+function lines(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map(item => item.trim())
+    .filter(Boolean);
 }
 
-export default function SecurityManager({ guildId, channels }: { guildId: string; channels: Channel[] }) {
-  const [overview, setOverview] = useState<SecurityOverview | null>(null);
+const PRESETS: Record<SecuritySettings["profile"], Partial<Thresholds>> = {
+  balanced: {
+    crossActionScore: 18,
+    channelDelete: 3,
+    roleDelete: 3,
+    webhook: 3,
+    banAdd: 6,
+    kick: 7,
+    raidJoins: 12,
+    raidWindowSeconds: 15,
+    severeContentUsers: 5,
+    severeContentWindowSeconds: 45
+  },
+  strict: {
+    crossActionScore: 12,
+    channelDelete: 2,
+    roleDelete: 2,
+    webhook: 2,
+    banAdd: 4,
+    kick: 5,
+    raidJoins: 8,
+    raidWindowSeconds: 12,
+    severeContentUsers: 3,
+    severeContentWindowSeconds: 30
+  },
+  paranoid: {
+    crossActionScore: 8,
+    channelDelete: 1,
+    roleDelete: 1,
+    webhook: 1,
+    banAdd: 3,
+    kick: 3,
+    raidJoins: 6,
+    raidWindowSeconds: 12,
+    severeContentUsers: 2,
+    severeContentWindowSeconds: 20
+  }
+};
+
+export default function SecurityManager({
+  guildId,
+  channels,
+  onNotice,
+  onError
+}: {
+  guildId: string;
+  channels: Channel[];
+  onNotice: (message: string) => void;
+  onError: (reason: unknown) => void;
+}) {
+  const [overview, setOverview] = useState<Overview | null>(null);
   const [draft, setDraft] = useState<SecuritySettings | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [trustedUsers, setTrustedUsers] = useState("");
+  const [trustedRoles, setTrustedRoles] = useState("");
+  const [allowedBots, setAllowedBots] = useState("");
+  const [allowedDomains, setAllowedDomains] = useState("");
+  const [blockedDomains, setBlockedDomains] = useState("");
+
+  const logChannels = useMemo(
+    () => channels.filter(channel =>
+      channel.type === "text" || channel.type === "announcement"
+    ),
+    [channels]
+  );
 
   async function load() {
     setBusy(true);
-    setError(null);
     try {
-      const data = await api<SecurityOverview>(`/api/guilds/${guildId}/security-center`);
+      const data = await api<Overview>(
+        `/api/guilds/${guildId}/security-center`,
+        {},
+        15_000
+      );
       setOverview(data);
       setDraft(data.settings);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (data.settings) {
+        setTrustedUsers(data.settings.trustedUserIds.join("\n"));
+        setTrustedRoles(data.settings.trustedRoleIds.join("\n"));
+        setAllowedBots(data.settings.allowedBotIds.join("\n"));
+        setAllowedDomains(data.settings.allowedDomains.join("\n"));
+        setBlockedDomains(data.settings.blockedDomains.join("\n"));
+      }
+    } catch (error) {
+      onError(error);
     } finally {
       setBusy(false);
     }
   }
 
-  useEffect(() => { void load(); }, [guildId]);
-
-  // Explicit refresh (the ボタン below) surfaces connection errors; this
-  // background poll stays quiet so a transient Gateway blip doesn't spam
-  // an error on every tick.
   useEffect(() => {
-    let cancelled = false;
-    const timer = window.setInterval(async () => {
-      try {
-        const data = await api<SecurityOverview>(`/api/guilds/${guildId}/security-center`);
-        if (cancelled) return;
-        setOverview(prev => (prev ? { ...prev, status: data.status, lockdown: data.lockdown, incidents: data.incidents } : data));
-      } catch {
-        // quiet
-      }
-    }, 10_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    void load();
   }, [guildId]);
+
+  function setModule(key: keyof SecurityModules, value: boolean) {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      modules: { ...draft.modules, [key]: value }
+    });
+  }
+
+  function applyProfile(profile: SecuritySettings["profile"]) {
+    if (!draft) return;
+    setDraft({
+      ...draft,
+      profile,
+      thresholds: {
+        ...draft.thresholds,
+        ...PRESETS[profile]
+      }
+    });
+  }
 
   async function save() {
     if (!draft) return;
     setBusy(true);
-    setError(null);
     try {
-      const saved = await api<SecuritySettings>(`/api/guilds/${guildId}/security-center/settings`, { method: "PUT", body: JSON.stringify(draft) });
+      const body: SecuritySettings = {
+        ...draft,
+        trustedUserIds: lines(trustedUsers),
+        trustedRoleIds: lines(trustedRoles),
+        allowedBotIds: lines(allowedBots),
+        allowedDomains: lines(allowedDomains),
+        blockedDomains: lines(blockedDomains)
+      };
+      const saved = await api<SecuritySettings>(
+        `/api/guilds/${guildId}/security-center`,
+        {
+          method: "PUT",
+          body: JSON.stringify(body)
+        },
+        15_000
+      );
       setDraft(saved);
-      setOverview(prev => (prev ? { ...prev, settings: saved } : prev));
-      setNotice("セキュリティ設定を保存しました");
-      window.setTimeout(() => setNotice(null), 3500);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      onNotice("Security Botの設定を保存しました");
+      await load();
+    } catch (error) {
+      onError(error);
     } finally {
       setBusy(false);
     }
   }
 
-  async function lockdown() {
+  async function setLockdown(active: boolean) {
     setBusy(true);
     try {
-      await api(`/api/guilds/${guildId}/security-center/lockdown`, { method: "POST", body: JSON.stringify({}) });
+      await api(
+        `/api/guilds/${guildId}/security-lockdown`,
+        active
+          ? {
+              method: "POST",
+              body: JSON.stringify({
+                minutes: draft?.response.lockdownMinutes ?? 15,
+                reason: "manual dashboard lockdown"
+              })
+            }
+          : { method: "DELETE" },
+        30_000
+      );
+      onNotice(active ? "緊急Lockdownを開始しました" : "Lockdownを解除しました");
       await load();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+    } catch (error) {
+      onError(error);
     } finally {
       setBusy(false);
     }
   }
 
-  async function unlock() {
-    setBusy(true);
-    try {
-      await api(`/api/guilds/${guildId}/security-center/lockdown`, { method: "DELETE" });
-      await load();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
+  if (!overview) {
+    return <article className="card">Security Botの状態を読み込んでいます…</article>;
   }
 
-  if (!draft || !overview) {
+  if (!overview.configured) {
     return (
-      <section className="card" style={{ padding: 24 }}>
-        {error ? <div className="alert error">{error}</div> : <p className="muted">読み込み中...</p>}
-      </section>
+      <article className="card">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">SECURITY BOT</span>
+            <h2>Security Botを接続してください</h2>
+          </div>
+        </div>
+        <p>
+          Main管理画面側の <code>SECURITY_API_BASE_URL</code> と
+          <code> SECURITY_BRIDGE_SECRET</code> がまだ設定されていません。
+          設定後も、この管理画面をそのまま使用します。
+        </p>
+      </article>
     );
   }
 
-  const logChannels = channels.filter(c => c.type === 0 || c.type === 5);
-
-  return (
-    <section className="stack">
-      {notice && <div className="alert success">{notice}</div>}
-      {error && <div className="alert error">{error}</div>}
-
-      <div className="card" style={{ padding: 24 }}>
+  if (overview.unreachable || !draft) {
+    return (
+      <article className="card">
         <div className="section-head">
           <div>
-            <span className="eyebrow">SECURITY</span>
-            <h2>セキュリティ</h2>
+            <span className="eyebrow">SECURITY BOT</span>
+            <h2>Security Botへ接続できません</h2>
           </div>
-          <div className="button-row" style={{ marginTop: 0 }}>
-            <span className={`status-pill ${overview.status.connected ? "good" : "bad"}`}>
-              <i /> Gateway {overview.status.connected ? "Online" : "Offline"}
+          <button type="button" className="secondary" onClick={() => void load()}>
+            再確認
+          </button>
+        </div>
+        <p>{overview.message ?? "Security Workerの状態を確認してください。"}</p>
+      </article>
+    );
+  }
+
+  return (
+    <div className="security-manager">
+      <section className="metric-grid">
+        <article className="metric card">
+          <span>PROTECTION</span>
+          <strong>{draft.enabled && draft.mode === "enforce" ? "ACTIVE" : draft.mode.toUpperCase()}</strong>
+          <small>{draft.profile.toUpperCase()} profile</small>
+        </article>
+        <article className="metric card">
+          <span>SECURITY BOT</span>
+          <strong>
+            {!overview.installed
+              ? "NOT INSTALLED"
+              : overview.status.connected
+                ? "ONLINE"
+                : "OFFLINE"}
+          </strong>
+          <small>
+            {!overview.installed
+              ? "このサーバーへ追加が必要です"
+              : overview.status.lastEventAt
+                ? "Last event " + new Date(overview.status.lastEventAt).toLocaleTimeString("ja-JP")
+                : "Gateway waiting"}
+          </small>
+        </article>
+        <article className="metric card">
+          <span>LOCKDOWN</span>
+          <strong>{overview.lockdown.active ? "ACTIVE" : "READY"}</strong>
+          <small>{overview.lockdown.reason ?? "Emergency containment"}</small>
+        </article>
+        <article className="metric card">
+          <span>INCIDENTS</span>
+          <strong>{overview.incidents.length}</strong>
+          <small>直近30件</small>
+        </article>
+        <article className="metric card">
+          <span>DEFENSE LEVEL</span>
+          <strong>
+            {overview.capabilities?.maximumProtection
+              ? "MAXIMUM"
+              : overview.capabilities?.requiredReady
+                ? "HARDENED"
+                : "DEGRADED"}
+          </strong>
+          <small>
+            {overview.capabilities?.maximumProtection
+              ? "Administrator overwrite bypass"
+              : overview.capabilities?.requiredReady
+                ? "必要権限は揃っています"
+                : "権限不足を確認してください"}
+          </small>
+        </article>
+      </section>
+
+      {overview.installed && overview.capabilities && (
+        !overview.capabilities.requiredReady ||
+        !overview.capabilities.maximumProtection
+      ) && (
+        <article className="card serverless-note">
+          <strong>
+            {overview.capabilities.missingPermissions.length > 0
+              ? "Security Botの権限が不足しています"
+              : "現在はHardenedモードです"}
+          </strong>
+          <span>
+            {overview.capabilities.missingPermissions.length > 0
+              ? "不足: " + overview.capabilities.missingPermissions.join(" / ")
+              : "最大保護ではSecurity BotへAdministratorを付与します。ただし人間管理者より上へ置く必要はありません。推奨は 人間の管理者 > Main Bot > Security Bot > 他社製Bot です。"}
+          </span>
+          {overview.maximumInviteUrl && !overview.capabilities.maximumProtection && (
+            <a
+              className="secondary"
+              href={overview.maximumInviteUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              最大保護の権限を付与
+            </a>
+          )}
+        </article>
+      )}
+
+      {overview.installed &&
+        overview.capabilities?.roleAboveDangerousRoles === false && (
+          <article className="card serverless-note">
+            <strong>人間管理者優先のロール階層を検出しました</strong>
+            <span>
+              Security Botより上にある管理系ロール: {" "}
+              {overview.capabilities.dangerousRolesNotBelow
+                .map(role => role.name)
+                .join(" / ")}
+              。これは異常ではありません。上位の人間管理者は自動Kick/BAN/Timeout/ロール剥奪や設定巻き戻しの対象外です。
+              明確な大量削除などを検知した場合だけ、本人を処罰せずサーバーLockdownで被害拡大を止めます。
             </span>
-            {!overview.capabilities.requiredReady && (
-              <span className="status-pill warn" title={overview.capabilities.missingPermissions.join(", ")}>
-                <i /> 権限不足
-              </span>
+          </article>
+        )}
+
+      <article className="card">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">SECURITY CENTER</span>
+            <h2>リアルタイム防御</h2>
+            <p>Main Botとは別Token・別Worker・別Gatewayで稼働します。Main Botを誤検知で自動Kickせず、破壊的挙動は検知・記録し、サーバー全体のLockdownを発動します。</p>
+          </div>
+          <div className="button-row">
+            {!overview.installed && (overview.maximumInviteUrl || overview.inviteUrl) && (
+              <>
+                <a
+                  className="primary"
+                  href={overview.maximumInviteUrl || overview.inviteUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  最大保護でSecurity Botを追加
+                </a>
+                {overview.maximumInviteUrl && overview.inviteUrl && (
+                  <a
+                    className="secondary"
+                    href={overview.inviteUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    最小権限で追加
+                  </a>
+                )}
+              </>
             )}
-            <button type="button" className="primary" onClick={() => void save()} disabled={busy}>
-              セキュリティ設定を保存
+            <button type="button" className="secondary" disabled={busy} onClick={() => void load()}>
+              更新
+            </button>
+            <button
+              type="button"
+              className={overview.lockdown.active ? "secondary" : "danger"}
+              disabled={
+                busy ||
+                (overview.lockdown.active &&
+                  overview.lockdown.manualUnlockAllowed === false)
+              }
+              onClick={() => void setLockdown(!overview.lockdown.active)}
+            >
+              {overview.lockdown.active
+                ? overview.lockdown.manualUnlockAllowed === false
+                  ? "自動Lockdown中"
+                  : "Lockdown解除"
+                : "緊急Lockdown"}
+            </button>
+            <button type="button" disabled={busy} onClick={() => void save()}>
+              設定を保存
             </button>
           </div>
         </div>
 
-        {!overview.capabilities.requiredReady && (
-          <div className="alert error">
-            Botに必要な権限が不足しています: {overview.capabilities.missingPermissions.join(", ")}
-            {" "}
-            <a href={overview.maximumInviteUrl} target="_blank" rel="noreferrer">権限を再付与する招待リンク</a>
-          </div>
+        <p className="serverless-note">
+          <strong>Bot共存モード</strong><br />
+          推奨ロール順は <strong>人間の管理者 &gt; Main Bot &gt; Security Bot &gt; 他社製Bot &gt; 一般ロール</strong> です。
+          人間管理者はすべてのBotより上に置き、Securityからの自動Kick/BAN/Timeout/ロール剥奪の対象外にします。
+          他社製Botの通常設定操作も誤検知でLockdown/Kickしません。
+          Securityより上に置いたBotはDiscordのロール階層上Kickできないため、Securityに停止させたいBotはSecurityより下に置いてください。
+        </p>
+
+        {overview.bridgeProtection?.coreLocked && (
+          <p className="serverless-note">
+            <strong>Core Protection Locked</strong><br />
+            Main Workerが侵害されてもSecurity Botを無効化できないよう、
+            Enforce・破壊対策Guard・Auto Lockdown・Safety BaselineはSecurity側で最低防御を強制します。
+            Trusted/Allow例外はMain管理画面から新規追加できず、既存例外の削除だけ可能です。
+          </p>
         )}
 
-        <div className="form-grid two">
+        {overview.lockdown.active &&
+          overview.lockdown.manualUnlockAllowed === false && (
+          <p className="serverless-note">
+            このLockdownは自動防御で発動したためMain Botからは解除できません。
+            {overview.lockdown.expiresAt
+              ? " 自動復旧予定: " +
+                new Date(overview.lockdown.expiresAt).toLocaleString("ja-JP")
+              : ""}
+          </p>
+        )}
+
+        <div className="form-grid">
           <label className="field">
             <span>動作モード</span>
-            <select value={draft.mode} onChange={e => setDraft({ ...draft, mode: e.target.value as "audit" | "enforce" })}>
-              <option value="enforce">enforce（検知して自動対処）</option>
-              <option value="audit">audit（記録のみ・自動対処なし）</option>
+            <select
+              value={draft.mode}
+              disabled={overview.bridgeProtection?.coreLocked}
+              onChange={event => setDraft({
+                ...draft,
+                mode: event.target.value as SecuritySettings["mode"]
+              })}
+            >
+              <option value="enforce">Enforce（検知して防御）</option>
+              <option value="audit">Audit only（記録のみ）</option>
             </select>
           </label>
           <label className="field">
-            <span>プリセット</span>
-            <select value={draft.profile} onChange={e => setDraft({ ...draft, profile: e.target.value as SecuritySettings["profile"] })}>
-              <option value="balanced">balanced</option>
-              <option value="strict">strict</option>
-              <option value="paranoid">paranoid</option>
+            <span>防御プロファイル</span>
+            <select
+              value={draft.profile}
+              onChange={event =>
+                applyProfile(event.target.value as SecuritySettings["profile"])
+              }
+            >
+              <option value="balanced">Balanced</option>
+              <option value="strict">Strict（推奨）</option>
+              <option value="paranoid">Paranoid</option>
             </select>
           </label>
-        </div>
-
-        <div className="toggle-stack">
-          <Toggle title="セキュリティ機能を有効化" description="オフにするとすべての検知・自動対処を停止します" value={draft.enabled} onChange={value => setDraft({ ...draft, enabled: value })} />
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <h2>検知モジュール</h2>
-        <div className="toggle-stack">
-          {(Object.keys(MODULE_LABELS) as Array<keyof SecurityModules>).map(key => {
-            const [title, description] = MODULE_LABELS[key];
-            return (
-              <Toggle
-                key={key}
-                title={title}
-                description={description}
-                value={draft.modules[key]}
-                onChange={value => setDraft({ ...draft, modules: { ...draft.modules, [key]: value } })}
-              />
-            );
-          })}
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">SERVER SAFETY</span>
-            <h2>Discord Safety Baseline</h2>
-            <p className="muted">Discord標準の安全フィルターも合わせて強制維持します。</p>
-          </div>
-          <strong>{overview.safetyStatus?.baselineReady ? "READY" : "CHECK"}</strong>
+          <label className="field">
+            <span>Security Log</span>
+            <select
+              value={draft.logChannelId ?? ""}
+              onChange={event => setDraft({
+                ...draft,
+                logChannelId: event.target.value || null
+              })}
+            >
+              <option value="">未設定</option>
+              {logChannels.map(channel => (
+                <option value={channel.id} key={channel.id}>#{channel.name}</option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <div className="toggle-stack">
           <Toggle
-            title="Explicit Content Filter: ALL MEMBERS"
-            description="常時有効にし、全メンバーのメディアをスキャンします"
+            value={draft.enabled}
+            onChange={enabled => setDraft({ ...draft, enabled })}
+            title="Security Engine"
+            description="独立防御のため常時ONです"
+            disabled={overview.bridgeProtection?.coreLocked}
+          />
+          <Toggle value={draft.modules.antiNuke} onChange={v => setModule("antiNuke", v)}
+            title="Anti-Nuke" description="Channel破壊と複合攻撃をGatewayでリアルタイム検知" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.antiRaid} onChange={v => setModule("antiRaid", v)}
+            title="Anti-Raid" description="短時間の大量参加を検知してLockdown・隔離" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.antiSpam} onChange={v => setModule("antiSpam", v)}
+            title="Anti-Spam / Mention Flood" description="連投と大量メンションをリアルタイム遮断" />
+          <Toggle value={draft.modules.antiPhishing} onChange={v => setModule("antiPhishing", v)}
+            title="Scam / Phishing Guard" description="危険URL・偽ログイン誘導を遮断" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.dangerousAttachments} onChange={v => setModule("dangerousAttachments", v)}
+            title="Dangerous Attachment Guard" description="実行ファイル・スクリプト系添付を遮断" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.botGuard} onChange={v => setModule("botGuard", v)}
+            title="Bot Guard" description="Bot追加を監査。権限が強いだけでは即Kickせず、追加後の破壊挙動を監視" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.webhookGuard} onChange={v => setModule("webhookGuard", v)}
+            title="Webhook Guard" description="Webhookを悪用した攻撃を検知" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.roleGuard} onChange={v => setModule("roleGuard", v)}
+            title="Role Guard" description="Role作成・変更・削除の異常操作を監視" disabled={overview.bridgeProtection?.coreLocked} />
+                    <Toggle value={draft.modules.permissionGuard} onChange={v => setModule("permissionGuard", v)}
+            title="Permission Guard" description="Administrator等の危険権限付与を即時ロールバック" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.memberGuard} onChange={v => setModule("memberGuard", v)}
+            title="Member Guard" description="短時間の大量Kick・Banを検知" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.guildGuard} onChange={v => setModule("guildGuard", v)}
+            title="Server / Integration Guard" description="サーバー設定・Integrationの異常変更を監視" disabled={overview.bridgeProtection?.coreLocked} />
+          <Toggle value={draft.modules.automodGuard} onChange={v => setModule("automodGuard", v)}
+            title="AutoMod Guard" description="AutoModの無断変更・削除を監視" disabled={overview.bridgeProtection?.coreLocked} />
+        </div>
+      </article>
+
+      <article className="card">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">SERVER SAFETY</span>
+            <h2>Discord Safety Baseline</h2>
+            <p>Security Botとは別に、Discord標準の安全フィルターも強制維持します。</p>
+          </div>
+          <strong>
+            {overview.safetyStatus?.baselineReady ? "READY" : "CHECK"}
+          </strong>
+        </div>
+
+        <div className="toggle-stack">
+          <Toggle
             value={draft.safety.enforceExplicitContentFilter}
-            onChange={value => setDraft({ ...draft, safety: { ...draft.safety, enforceExplicitContentFilter: value } })}
+            onChange={value => setDraft({
+              ...draft,
+              safety: { ...draft.safety, enforceExplicitContentFilter: value }
+            })}
+            title="Explicit Content Filter: ALL MEMBERS"
+            description="独立防御の最低ラインとして常時有効です"
+            disabled={overview.bridgeProtection?.coreLocked}
           />
         </div>
 
-        <div className="form-grid two">
-          <Field label="最低Verification Level">
+        <div className="form-grid">
+          <label className="field">
+            <span>最低Verification Level</span>
             <select
               value={draft.safety.minimumVerificationLevel}
-              onChange={e => setDraft({ ...draft, safety: { ...draft.safety, minimumVerificationLevel: Number(e.target.value) } })}
+              onChange={event => setDraft({
+                ...draft,
+                safety: {
+                  ...draft.safety,
+                  minimumVerificationLevel: Number(event.target.value)
+                }
+              })}
             >
-              <option value={0}>None</option>
-              <option value={1}>Low（メール認証）</option>
+              <option value={0} disabled>None</option>
+              <option value={1} disabled>Low（メール認証）</option>
               <option value={2}>Medium（推奨最低値）</option>
               <option value={3}>High</option>
               <option value={4}>Very High（電話番号認証）</option>
             </select>
-          </Field>
-          <Field label="現在のExplicit Filter">
+          </label>
+          <label className="field">
+            <span>現在のExplicit Filter</span>
             <input
-              readOnly
               value={
                 overview.safetyStatus
                   ? overview.safetyStatus.explicitContentFilter === 2
@@ -309,131 +703,267 @@ export default function SecurityManager({ guildId, channels }: { guildId: string
                       : "DISABLED"
                   : "取得待ち"
               }
+              readOnly
             />
-          </Field>
-          <Field label="Server 2FA">
-            <input readOnly value={overview.safetyStatus?.mfaLevel === 1 ? "ENABLED" : "DISABLED"} />
-          </Field>
-          <Field label="Raid Alerts">
-            <input readOnly value={overview.safetyStatus?.raidAlertsEnabled ? "ENABLED" : "DISABLED / UNKNOWN"} />
-          </Field>
+          </label>
+          <label className="field">
+            <span>Server 2FA</span>
+            <input
+              value={overview.safetyStatus?.mfaLevel === 1 ? "ENABLED" : "DISABLED"}
+              readOnly
+            />
+          </label>
+          <label className="field">
+            <span>Raid Alerts</span>
+            <input
+              value={overview.safetyStatus?.raidAlertsEnabled ? "ENABLED" : "DISABLED / UNKNOWN"}
+              readOnly
+            />
+          </label>
         </div>
-      </div>
 
-      <div className="card" style={{ padding: 24 }}>
-        <h2>自動対処</h2>
-        <div className="toggle-stack">
-          <Toggle title="危険なロールの剥奪" description="制裁対象から危険な権限を持つロールを剥奪します" value={draft.response.stripDangerousRoles} onChange={value => setDraft({ ...draft, response: { ...draft.response, stripDangerousRoles: value } })} />
-          <Toggle title="悪性Botの自動Kick" description="検知した悪性Botを自動でKickします" value={draft.response.kickMaliciousBots} onChange={value => setDraft({ ...draft, response: { ...draft.response, kickMaliciousBots: value } })} />
-          <Toggle title="自動Lockdown" description="高信頼度の攻撃を検知した際に自動でサーバーをLockdownします" value={draft.response.autoLockdown} onChange={value => setDraft({ ...draft, response: { ...draft.response, autoLockdown: value } })} />
-          <Toggle title="危険な投稿の自動削除" description="フィッシング/スパムと判定した投稿を自動削除します" value={draft.response.deleteUnsafeMessages} onChange={value => setDraft({ ...draft, response: { ...draft.response, deleteUnsafeMessages: value } })} />
-          <Toggle title="Raid参加者の自動タイムアウト" description="Raid中の新規アカウントを自動でタイムアウトします" value={draft.response.quarantineRaidJoins} onChange={value => setDraft({ ...draft, response: { ...draft.response, quarantineRaidJoins: value } })} />
-        </div>
-        <div className="form-grid two">
-          <Field label="制裁タイムアウト（分）">
-            <input type="number" min={1} max={40320} value={draft.response.timeoutMinutes} onChange={e => setDraft({ ...draft, response: { ...draft.response, timeoutMinutes: Number(e.target.value) } })} />
-          </Field>
-          <Field label="Lockdown時間（分）">
-            <input type="number" min={1} max={180} value={draft.response.lockdownMinutes} onChange={e => setDraft({ ...draft, response: { ...draft.response, lockdownMinutes: Number(e.target.value) } })} />
-          </Field>
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <h2>しきい値</h2>
-        <div className="form-grid three">
-          <Field label="検知ウィンドウ（秒）"><input type="number" min={2} max={120} value={draft.thresholds.actionWindowSeconds} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, actionWindowSeconds: Number(e.target.value) } })} /></Field>
-          <Field label="チャンネル削除"><input type="number" min={1} max={30} value={draft.thresholds.channelDelete} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, channelDelete: Number(e.target.value) } })} /></Field>
-          <Field label="ロール削除"><input type="number" min={1} max={30} value={draft.thresholds.roleDelete} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, roleDelete: Number(e.target.value) } })} /></Field>
-          <Field label="BAN"><input type="number" min={1} max={50} value={draft.thresholds.banAdd} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, banAdd: Number(e.target.value) } })} /></Field>
-          <Field label="Kick"><input type="number" min={1} max={50} value={draft.thresholds.kick} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, kick: Number(e.target.value) } })} /></Field>
-          <Field label="Webhook作成"><input type="number" min={1} max={30} value={draft.thresholds.webhook} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, webhook: Number(e.target.value) } })} /></Field>
-          <Field label="Raid参加人数"><input type="number" min={2} max={1000} value={draft.thresholds.raidJoins} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, raidJoins: Number(e.target.value) } })} /></Field>
-          <Field label="Raidウィンドウ（秒）"><input type="number" min={2} max={300} value={draft.thresholds.raidWindowSeconds} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, raidWindowSeconds: Number(e.target.value) } })} /></Field>
-          <Field label="スパム投稿数"><input type="number" min={2} max={50} value={draft.thresholds.spamMessages} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, spamMessages: Number(e.target.value) } })} /></Field>
-          <Field label="最低アカウント年齢（時間）"><input type="number" min={0} max={87600} value={draft.thresholds.minAccountAgeHours} onChange={e => setDraft({ ...draft, thresholds: { ...draft.thresholds, minAccountAgeHours: Number(e.target.value) } })} /></Field>
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <h2>通知・例外設定</h2>
-        <Field label="ログチャンネル" hint="Security Incidentの通知を送信するチャンネルです">
-          <select value={draft.logChannelId ?? ""} onChange={e => setDraft({ ...draft, logChannelId: e.target.value || null })}>
-            <option value="">チャンネルを選択</option>
-            {logChannels.map(channel => (
-              <option key={channel.id} value={channel.id}>#{channel.name}</option>
-            ))}
-          </select>
-        </Field>
-        <div className="form-grid two">
-          <Field label="信頼するユーザーID（改行区切り）">
-            <textarea
-              value={draft.trustedUserIds.join("\n")}
-              onChange={e => setDraft({ ...draft, trustedUserIds: e.target.value.split("\n").map(s => s.trim()).filter(Boolean) })}
-            />
-          </Field>
-          <Field label="信頼するロールID（改行区切り）">
-            <textarea
-              value={draft.trustedRoleIds.join("\n")}
-              onChange={e => setDraft({ ...draft, trustedRoleIds: e.target.value.split("\n").map(s => s.trim()).filter(Boolean) })}
-            />
-          </Field>
-          <Field label="信頼するBotID（改行区切り）">
-            <textarea
-              value={draft.allowedBotIds.join("\n")}
-              onChange={e => setDraft({ ...draft, allowedBotIds: e.target.value.split("\n").map(s => s.trim()).filter(Boolean) })}
-            />
-          </Field>
-          <Field label="ブロックするドメイン（改行区切り）">
-            <textarea
-              value={draft.blockedDomains.join("\n")}
-              onChange={e => setDraft({ ...draft, blockedDomains: e.target.value.split("\n").map(s => s.trim()).filter(Boolean) })}
-            />
-          </Field>
-        </div>
-      </div>
-
-      <div className="card" style={{ padding: 24 }}>
-        <div className="section-head">
-          <h2>Lockdown</h2>
-          {overview.lockdown.active ? (
-            <button type="button" className="danger" onClick={() => void unlock()} disabled={busy || !overview.lockdown.manualUnlockAllowed}>
-              Lockdownを解除
-            </button>
-          ) : (
-            <button type="button" className="danger" onClick={() => void lockdown()} disabled={busy}>
-              今すぐLockdown
-            </button>
-          )}
-        </div>
-        {overview.lockdown.active ? (
-          <p className="muted">
-            発動中（理由: {overview.lockdown.reason}）。
-            {overview.lockdown.expiresAt && ` 自動解除: ${new Date(overview.lockdown.expiresAt).toLocaleString("ja-JP")}`}
-            {!overview.lockdown.manualUnlockAllowed && " 自動防御による発動のため手動解除はできません。"}
+        {overview.safetyStatus?.mfaLevel === 0 && (
+          <p className="serverless-note">
+            管理操作の2FA必須化はDiscord側のSafety Setupから有効にしてください。
+            Security Botから勝手に変更せず、状態だけ監視します。
           </p>
-        ) : (
-          <p className="muted">現在Lockdownは発動していません。</p>
         )}
-      </div>
+      </article>
 
-      <div className="card" style={{ padding: 24 }}>
-        <h2>Incident Log</h2>
-        {overview.incidents.length === 0 && <p className="muted">まだ記録はありません。</p>}
-        <div className="stack">
-          {overview.incidents.map(incident => (
-            <div key={incident.id} className="toggle-row">
-              <span className="toggle-copy">
-                <strong>{incident.summary}</strong>
-                <small>{incident.kind} · {incident.actorId ? `<@${incident.actorId}>` : "actor不明"} · {new Date(incident.createdAt).toLocaleString("ja-JP")}</small>
-              </span>
-              <span className={`status-pill ${severityColor(incident.severity)}`}>
-                <i /> {incident.severity}
-              </span>
-            </div>
-          ))}
+      <article className="card">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">CONTAINMENT</span>
+            <h2>攻撃時の自動対応</h2>
+          </div>
         </div>
-      </div>
-    </section>
+        <div className="toggle-stack">
+          <Toggle
+            value={draft.response.stripDangerousRoles}
+            onChange={value => setDraft({
+              ...draft,
+              response: { ...draft.response, stripDangerousRoles: value }
+            })}
+            title="危険権限ロールを剥奪"
+            description="攻撃者から管理系権限を持つロールを除去"
+            disabled={overview.bridgeProtection?.coreLocked}
+          />
+          <Toggle
+            value={draft.response.kickMaliciousBots}
+            onChange={value => setDraft({
+              ...draft,
+              response: { ...draft.response, kickMaliciousBots: value }
+            })}
+            title="攻撃BotをKick"
+            description="他のSecurity/Moderation Botによる大量BAN・Kickだけでは自動Kickしません。チャンネル/ロールの極端な破壊が確認されたBotは対象にします"
+            disabled={overview.bridgeProtection?.coreLocked}
+          />
+          <Toggle
+            value={draft.response.autoLockdown}
+            onChange={value => setDraft({
+              ...draft,
+              response: { ...draft.response, autoLockdown: value }
+            })}
+            title="Auto Lockdown"
+            description="重大攻撃時に@everyoneの送信・通話・Thread作成を一時停止"
+            disabled={overview.bridgeProtection?.coreLocked}
+          />
+        </div>
+        <div className="form-grid">
+          <label className="field">
+            <span>攻撃者Timeout（分）</span>
+            <input
+              type="number"
+              min={1}
+              max={40320}
+              value={draft.response.timeoutMinutes}
+              onChange={event => setDraft({
+                ...draft,
+                response: {
+                  ...draft.response,
+                  timeoutMinutes: Number(event.target.value)
+                }
+              })}
+            />
+          </label>
+          <label className="field">
+            <span>Lockdown（分）</span>
+            <input
+              type="number"
+              min={1}
+              max={180}
+              value={draft.response.lockdownMinutes}
+              onChange={event => setDraft({
+                ...draft,
+                response: {
+                  ...draft.response,
+                  lockdownMinutes: Number(event.target.value)
+                }
+              })}
+            />
+          </label>
+        </div>
+      </article>
+
+      <article className="card">
+        <details>
+          <summary><strong>詳細設定・例外</strong></summary>
+          <div className="form-grid security-advanced">
+            <label className="field">
+              <span>Trusted User IDs</span>
+              <textarea value={trustedUsers} onChange={event => setTrustedUsers(event.target.value)} />
+              <small>既存例外の削除のみ可能です。Main管理画面から新規追加はできません。</small>
+            </label>
+            <label className="field">
+              <span>Trusted Role IDs</span>
+              <textarea value={trustedRoles} onChange={event => setTrustedRoles(event.target.value)} />
+              <small>既存例外の削除のみ可能です。新規Trusted Role追加はSecurity側で拒否します。</small>
+            </label>
+            <label className="field">
+              <span>追加を許可するBot IDs</span>
+              <textarea value={allowedBots} onChange={event => setAllowedBots(event.target.value)} />
+              <small>通常の連携Botは登録不要です。既存の明示保護IDは削除のみ可能で、新規例外はMain経由では追加できません。</small>
+            </label>
+            <label className="field">
+              <span>許可ドメイン</span>
+              <textarea value={allowedDomains} onChange={event => setAllowedDomains(event.target.value)} />
+              <small>既存許可の削除のみ可能です。新規Allowlist追加はMain経由では拒否します。</small>
+            </label>
+            <label className="field">
+              <span>強制ブロックドメイン</span>
+              <textarea value={blockedDomains} onChange={event => setBlockedDomains(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>Cross-action Risk閾値</span>
+              <input
+                type="number"
+                min={4}
+                max={20}
+                value={draft.thresholds.crossActionScore}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    crossActionScore: Number(event.target.value)
+                  }
+                })}
+              />
+            </label>
+            <label className="field">
+              <span>Raid人数</span>
+              <input
+                type="number"
+                min={2}
+                max={20}
+                value={draft.thresholds.raidJoins}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    raidJoins: Number(event.target.value)
+                  }
+                })}
+              />
+            </label>
+            <label className="field">
+              <span>Raid判定秒数</span>
+              <input
+                type="number"
+                min={2}
+                max={300}
+                value={draft.thresholds.raidWindowSeconds}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    raidWindowSeconds: Number(event.target.value)
+                  }
+                })}
+              />
+            </label>
+            <label className="field">
+              <span>1投稿のメンション上限</span>
+              <input
+                type="number"
+                min={2}
+                max={100}
+                value={draft.thresholds.mentionLimit}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    mentionLimit: Number(event.target.value)
+                  }
+                })}
+              />
+            </label>
+            <label className="field">
+              <span>重大投稿の複数ユーザー閾値</span>
+              <input
+                type="number"
+                min={2}
+                max={6}
+                value={draft.thresholds.severeContentUsers}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    severeContentUsers: Number(event.target.value)
+                  }
+                })}
+              />
+              <small>Phishing / 危険添付を短時間に投稿した異なるユーザー数です。</small>
+            </label>
+            <label className="field">
+              <span>重大投稿の監視秒数</span>
+              <input
+                type="number"
+                min={5}
+                max={300}
+                value={draft.thresholds.severeContentWindowSeconds}
+                onChange={event => setDraft({
+                  ...draft,
+                  thresholds: {
+                    ...draft.thresholds,
+                    severeContentWindowSeconds: Number(event.target.value)
+                  }
+                })}
+              />
+              <small>閾値到達時は自動Lockdown設定に従って封じ込めます。</small>
+            </label>
+          </div>
+        </details>
+      </article>
+
+      <article className="card">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">INCIDENTS</span>
+            <h2>Security Log</h2>
+          </div>
+        </div>
+        {overview.incidents.length === 0 ? (
+          <p>記録されたインシデントはありません。</p>
+        ) : (
+          <div className="security-incidents">
+            {overview.incidents.map(incident => (
+              <div className="security-incident" key={incident.id}>
+                <div>
+                  <strong>{incident.kind}</strong>
+                  <span className={`security-severity ${incident.severity}`}>
+                    {incident.severity.toUpperCase()}
+                  </span>
+                </div>
+                <p>{incident.summary}</p>
+                <small>
+                  {new Date(incident.createdAt).toLocaleString("ja-JP")}
+                  {incident.actorId ? " / Actor " + incident.actorId : ""}
+                </small>
+              </div>
+            ))}
+          </div>
+        )}
+      </article>
+    </div>
   );
 }

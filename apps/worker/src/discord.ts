@@ -1,90 +1,310 @@
-import type { Env } from "./types";
+import type { Env, GuildSettings, SessionRow } from "./types";
+import { decrypt, encrypt, hexToBytes, toArrayBuffer } from "./utils";
+import { updateSessionTokens } from "./db";
 
-function hexToU8(hex: string): Uint8Array {
-  const arr = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < arr.length; i++) arr[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return arr;
-}
+const API="https://discord.com/api/v10";
 
-export async function verifyInteraction(env: Env, request: Request, body: string): Promise<boolean> {
-  try {
-    const sig = request.headers.get("X-Signature-Ed25519");
-    const ts = request.headers.get("X-Signature-Timestamp");
-    if (!sig || !ts) return false;
-    const key = await crypto.subtle.importKey(
-      "raw", hexToU8(env.DISCORD_PUBLIC_KEY),
-      { name: "NODE-ED25519", namedCurve: "NODE-ED25519" },
-      false, ["verify"]
-    );
-    return crypto.subtle.verify(
-      "NODE-ED25519", key, hexToU8(sig),
-      new TextEncoder().encode(ts + body)
-    );
-  } catch {
-    return false;
-  }
-}
+export type DiscordUser={
+  id:string;
+  username:string;
+  global_name?:string|null;
+  avatar?:string|null;
+};
+
+export type DiscordGuild={
+  id:string;
+  name:string;
+  icon:string|null;
+  owner:boolean;
+  permissions:string;
+};
+
+export type DiscordChannel={
+  id:string;
+  name:string;
+  type:number;
+  guild_id?:string;
+  parent_id?:string|null;
+  topic?:string|null;
+  position?:number;
+  permission_overwrites?:Array<{
+    id:string;
+    type:number;
+    allow:string;
+    deny:string;
+  }>;
+};
+
+export type DiscordRole={
+  id:string;
+  name:string;
+  permissions:string;
+  position:number;
+  managed:boolean;
+  color:number;
+  tags?:{
+    bot_id?:string;
+    integration_id?:string;
+    premium_subscriber?:null;
+  };
+};
 
 export class DiscordApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
+  constructor(public status:number, message:string, public retryAfterMs?:number){ super(message); }
+}
+
+// Discordが長い待ち時間（チャンネル名変更の「10分に2回」など）を返したときは、待たずにすぐ失敗させる。
+// Worker内で数分待つと、管理画面のリクエストがタイムアウトするだけで何も得られない。
+const MAX_RATE_LIMIT_WAIT_MS=5_000;
+
+export async function botFetch(
+  env:Env,
+  path:string,
+  init:RequestInit={}
+):Promise<Response>{
+  const headers=new Headers(init.headers);
+  headers.set("Authorization",`Bot ${env.DISCORD_BOT_TOKEN.trim()}`);
+  if(init.body&&!headers.has("Content-Type")) headers.set("Content-Type","application/json");
+
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),12_000);
+  const externalSignal=init.signal;
+  const abortFromExternal=()=>controller.abort();
+  externalSignal?.addEventListener("abort",abortFromExternal,{once:true});
+
+  try{
+    return await fetch(`${API}${path}`,{
+      ...init,
+      headers,
+      signal:controller.signal
+    });
+  }catch(error){
+    if(controller.signal.aborted&&!externalSignal?.aborted){
+      throw new DiscordApiError(
+        504,
+        "Discord APIの応答がタイムアウトしました。少し待って再試行してください"
+      );
+    }
+    throw error;
+  }finally{
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort",abortFromExternal);
   }
 }
 
-export async function botFetch(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`https://discord.com/api/v10${path}`, {
-    ...init,
-    headers: {
-      "Authorization": `Bot ${env.DISCORD_BOT_TOKEN}`,
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
+export async function botJson<T>(
+  env:Env,
+  path:string,
+  init:RequestInit={}
+):Promise<T>{
+  for(let attempt=0;attempt<3;attempt++){
+    const response=await botFetch(env,path,init);
+
+    if(response.status===429){
+      const raw=await response.text().catch(()=>"");
+      let retryAfterMs=1000;
+      try{
+        const payload=JSON.parse(raw) as {retry_after?:number};
+        if(typeof payload.retry_after==="number"&&Number.isFinite(payload.retry_after)){
+          retryAfterMs=Math.max(100,Math.ceil(payload.retry_after*1000));
+        }
+      }catch{
+        const header=response.headers.get("Retry-After");
+        const seconds=header?Number(header):NaN;
+        if(Number.isFinite(seconds)) retryAfterMs=Math.max(100,Math.ceil(seconds*1000));
+      }
+
+      if(attempt<2&&retryAfterMs<=MAX_RATE_LIMIT_WAIT_MS){
+        await new Promise(resolve=>setTimeout(resolve,retryAfterMs+50));
+        continue;
+      }
+      const wait=retryAfterMs>=60_000
+        ?`約${Math.ceil(retryAfterMs/60_000)}分`
+        :`約${Math.ceil(retryAfterMs/1000)}秒`;
+      throw new DiscordApiError(429, `Discord APIのレート制限中です。${wait}待ってから再試行してください`,retryAfterMs);
+    }
+
+    if(!response.ok){
+      const text=await response.text().catch(()=>"");
+      throw new DiscordApiError(response.status, `Discord API ${response.status}: ${text.slice(0,300)}`);
+    }
+    if(response.status===204) return undefined as T;
+    return response.json() as Promise<T>;
+  }
+
+  throw new Error("Discord API request failed");
+}
+
+export async function userJson<T>(path:string,accessToken:string):Promise<T>{
+  const response=await fetch(`${API}${path}`,{
+    headers:{Authorization:`Bearer ${accessToken}`}
   });
+  if(!response.ok) throw new Error(`Discord user API ${response.status}`);
+  return response.json() as Promise<T>;
 }
 
-export async function botJson<T>(env: Env, path: string, init: RequestInit = {}): Promise<T> {
-  const res = await botFetch(env, path, init);
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new DiscordApiError(res.status, `Discord API ${res.status}: ${detail.slice(0, 300)}`);
+function basic(env:Env):string{
+  return btoa(`${env.DISCORD_APPLICATION_ID}:${env.DISCORD_CLIENT_SECRET}`);
+}
+
+export function oauthAuthorizeUrl(env:Env,origin:string,state:string):string{
+  const redirect=`${origin}/auth/discord/callback`;
+  const params=new URLSearchParams({
+    client_id:env.DISCORD_APPLICATION_ID,
+    response_type:"code",
+    redirect_uri:redirect,
+    scope:"identify guilds",
+    state,
+    prompt:"consent"
+  });
+  return `https://discord.com/oauth2/authorize?${params.toString()}`;
+}
+
+async function oauthToken(env:Env,params:URLSearchParams):Promise<{
+  access_token:string;
+  refresh_token:string;
+  expires_in:number;
+}>{
+  const response=await fetch(`${API}/oauth2/token`,{
+    method:"POST",
+    headers:{
+      Authorization:`Basic ${basic(env)}`,
+      "Content-Type":"application/x-www-form-urlencoded"
+    },
+    body:params
+  });
+  if(!response.ok) throw new Error(`Discord OAuth ${response.status}`);
+  return response.json();
+}
+
+export async function exchangeCode(env:Env,origin:string,code:string){
+  return oauthToken(env,new URLSearchParams({
+    grant_type:"authorization_code",
+    code,
+    redirect_uri:`${origin}/auth/discord/callback`
+  }));
+}
+
+export async function validAccessToken(env:Env,session:SessionRow):Promise<string>{
+  if(session.token_expires_at>Date.now()+60_000){
+    return decrypt(env.SESSION_ENCRYPTION_KEY,session.access_token_enc);
   }
-  // Several Discord endpoints (e.g. the bulk channel-position PATCH) return
-  // 204 No Content on success — res.json() throws on an empty body.
-  if (res.status === 204) return undefined as T;
-  const text = await res.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  const refreshed=await oauthToken(env,new URLSearchParams({
+    grant_type:"refresh_token",
+    refresh_token:await decrypt(env.SESSION_ENCRYPTION_KEY,session.refresh_token_enc)
+  }));
+  const accessEnc=await encrypt(env.SESSION_ENCRYPTION_KEY,refreshed.access_token);
+  const refreshEnc=await encrypt(env.SESSION_ENCRYPTION_KEY,refreshed.refresh_token);
+  const expiresAt=Date.now()+refreshed.expires_in*1000;
+  await updateSessionTokens(env,session.token_hash,accessEnc,refreshEnc,expiresAt);
+  session.access_token_enc=accessEnc;
+  session.refresh_token_enc=refreshEnc;
+  session.token_expires_at=expiresAt;
+  return refreshed.access_token;
 }
 
-export interface DiscordPermissionOverwrite {
-  id: string;
-  type: number; // 0 = role, 1 = member
-  allow: string;
-  deny: string;
+export function canManageGuild(guild:DiscordGuild):boolean{
+  const permissions=BigInt(guild.permissions);
+  return guild.owner||(permissions&8n)===8n||(permissions&32n)===32n;
 }
 
-export interface DiscordChannel {
-  id: string;
-  name: string;
-  type: number;
-  parent_id?: string | null;
-  position?: number;
-  topic?: string | null;
-  permission_overwrites?: DiscordPermissionOverwrite[];
+export async function verifyInteraction(
+  env:Env,
+  request:Request,
+  bodyText:string
+):Promise<boolean>{
+  const signature=request.headers.get("X-Signature-Ed25519");
+  const timestamp=request.headers.get("X-Signature-Timestamp");
+  if(!signature||!timestamp) return false;
+  const key=await crypto.subtle.importKey(
+    "raw",
+    toArrayBuffer(hexToBytes(env.DISCORD_PUBLIC_KEY)),
+    {name:"Ed25519"} as AlgorithmIdentifier,
+    false,
+    ["verify"]
+  );
+  const message=new TextEncoder().encode(timestamp+bodyText);
+  return crypto.subtle.verify(
+    {name:"Ed25519"} as AlgorithmIdentifier,
+    key,
+    toArrayBuffer(hexToBytes(signature)),
+    toArrayBuffer(message)
+  );
 }
 
-export interface DiscordRole {
-  id: string;
-  name: string;
-  color: number;
-  position: number;
-  managed: boolean;
-  permissions?: string;
-  tags?: { bot_id?: string };
-}
+export async function syncAutoMod(
+  env:Env,
+  guildId:string,
+  settings:GuildSettings
+):Promise<string[]>{
+  const warnings:string[]=[];
+  let existing:Array<{id:string;name:string}>;
+  try{existing=await botJson<Array<{id:string;name:string}>>(
+    env,`/guilds/${guildId}/auto-moderation/rules`
+  );}catch{
+    return ["設定は保存しましたが、Discordの自動モデレーション設定を取得できず適用できませんでした。「サーバー管理」権限を確認して再保存してください。"];
+  }
 
-export interface DiscordUser {
-  id: string;
-  username: string;
-  global_name?: string | null;
-  avatar?: string | null;
+  const alertAction=settings.logChannelId
+    ? [{type:2,metadata:{channel_id:settings.logChannelId}}]
+    : [];
+  const block=(message:string)=>[
+    {type:1,metadata:{custom_message:message}},
+    ...alertAction
+  ];
+
+  const rules:Array<Record<string,unknown>>=[];
+  if(settings.antiSpam){
+    rules.push({
+      name:"DSM Anti-Spam",
+      event_type:1,
+      trigger_type:3,
+      trigger_metadata:{},
+      actions:block("スパムを検出しました。"),
+      enabled:true
+    });
+  }
+  if(settings.blockInvites){
+    rules.push({
+      name:"DSM Invite Guard",
+      event_type:1,
+      trigger_type:1,
+      trigger_metadata:{
+        keyword_filter:[
+          "*discord.gg/*",
+          "*discord.com/invite/*",
+          "*discordapp.com/invite/*"
+        ]
+      },
+      actions:block("外部Discord招待リンクは禁止されています。"),
+      enabled:true
+    });
+  }
+  rules.push({
+    name:"DSM Mention Guard",
+    event_type:1,
+    trigger_type:5,
+    trigger_metadata:{mention_total_limit:settings.mentionLimit},
+    actions:block("大量メンションを検出しました。"),
+    enabled:true
+  });
+
+  const desired=settings.securityEnabled?rules:[];
+  for(const rule of desired){
+    const prior=existing.find(item=>item.name===rule.name);
+    const payload={...rule};
+    if(prior) delete payload.trigger_type;
+    await botJson(env,`/guilds/${guildId}/auto-moderation/rules${prior?"/"+prior.id:""}`,{
+      method:prior?"PATCH":"POST",
+      body:JSON.stringify(payload)
+    }).catch(()=>{warnings.push("設定は保存しましたが、"+String(rule.name)+" をDiscordへ適用できませんでした。権限・ルール上限を確認して再保存してください。");});
+  }
+  for(const rule of existing){
+    if(rule.name.startsWith("DSM ")&&!desired.some(item=>item.name===rule.name)){
+      await botJson(env,`/guilds/${guildId}/auto-moderation/rules/${rule.id}`,{
+        method:"DELETE"
+      }).catch(()=>{warnings.push("設定は保存しましたが、"+rule.name+" の解除に失敗しました。権限を確認して再保存してください。");});
+    }
+  }
+  return warnings;
 }

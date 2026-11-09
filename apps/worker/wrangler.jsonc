@@ -9,6 +9,12 @@
   "durable_objects": {
     "bindings": [
       {
+        // Discord-Bot (Main) の Gateway
+        "name": "DISCORD_GATEWAY",
+        "class_name": "DiscordGateway"
+      },
+      {
+        // Discord-Security の Gateway (同一Worker内に統合)
         "name": "SECURITY_GATEWAY",
         "class_name": "DiscordSecurityGateway"
       }
@@ -18,13 +24,23 @@
     {
       "tag": "security-gateway-v1",
       "new_sqlite_classes": ["DiscordSecurityGateway"]
+    },
+    {
+      "tag": "discord-gateway-v1",
+      "new_sqlite_classes": ["DiscordGateway"]
     }
   ],
   "d1_databases": [
     {
+      // Main (Discord-Bot + Amazon自販機)
       "binding": "DB",
       "database_name": "cc-server-db",
       "database_id": "263e833e-b360-42bf-b7eb-c89286bc174b"
+    },
+    {
+      // Discord-Security 専用D1 (初回デプロイ時に自動作成)
+      "binding": "SECURITY_DB",
+      "database_name": "cc-server-security-db"
     }
   ],
   "triggers": {
@@ -32,6 +48,7 @@
   },
   "vars": {
     "WEB_ORIGIN": "https://mnaoki20081106-afk.github.io",
-    "WEB_PUBLIC_URL": "https://mnaoki20081106-afk.github.io/CC-server/"
+    "WEB_PUBLIC_URL": "https://mnaoki20081106-afk.github.io/CC-server/",
+    "DISCORD_OAUTH_REDIRECT_URI": "https://cc-server.mnaoki20081106.workers.dev/auth/discord/callback"
   }
 }

@@ -1,129 +1,558 @@
 import type { Env } from "./types";
+import { randomId } from "./utils";
 
-export const BACKUP_SCHEMA_STATEMENTS = [
+export type BackupRow = {
+  id:string;
+  source_guild_id:string;
+  source_guild_name:string;
+  label:string|null;
+  created_at:number;
+  schema_version:number;
+  payload_enc:string;
+  role_count:number;
+  channel_count:number;
+  member_count:number;
+  recovery_member_count:number;
+  warnings_json:string;
+};
+
+export type RestoreJobRow = {
+  id:string;
+  backup_id:string;
+  target_guild_id:string;
+  status:"queued"|"running"|"completed"|"failed"|"cancelled";
+  phase:string;
+  cursor:number;
+  role_map_json:string;
+  channel_map_json:string;
+  vm_map_json:string;
+  product_map_json:string;
+  result_json:string;
+  error:string|null;
+  created_at:number;
+  updated_at:number;
+};
+
+export type RecoveryMemberRow = {
+  guild_id:string;
+  user_id:string;
+  username:string;
+  access_token_enc:string;
+  refresh_token_enc:string;
+  token_expires_at:number;
+  revoked_at:number|null;
+  created_at:number;
+  updated_at:number;
+};
+
+export type PanelDeploymentRow = {
+  guild_id:string;
+  kind:string;
+  object_id:string;
+  channel_id:string;
+  message_id:string|null;
+  created_at:number;
+  updated_at:number;
+};
+
+const schema = [
+  "CREATE TABLE IF NOT EXISTS backup_sweep_lease (id INTEGER PRIMARY KEY,owner TEXT NOT NULL,expires_at INTEGER NOT NULL)",
   `CREATE TABLE IF NOT EXISTS guild_backups (
     id TEXT PRIMARY KEY,
     source_guild_id TEXT NOT NULL,
     source_guild_name TEXT NOT NULL,
     label TEXT,
     created_at INTEGER NOT NULL,
-    payload TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    payload_enc TEXT NOT NULL,
     role_count INTEGER NOT NULL DEFAULT 0,
     channel_count INTEGER NOT NULL DEFAULT 0,
     member_count INTEGER NOT NULL DEFAULT 0,
+    recovery_member_count INTEGER NOT NULL DEFAULT 0,
     warnings_json TEXT NOT NULL DEFAULT '[]'
   )`,
-  `CREATE INDEX IF NOT EXISTS guild_backups_source_idx ON guild_backups(source_guild_id, created_at DESC)`,
+  "CREATE INDEX IF NOT EXISTS guild_backups_source_idx ON guild_backups(source_guild_id,created_at DESC)",
+  `CREATE TABLE IF NOT EXISTS guild_backup_chunks (
+    backup_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    payload_chunk TEXT NOT NULL,
+    PRIMARY KEY(backup_id,chunk_index)
+  )`,
+  "CREATE INDEX IF NOT EXISTS guild_backup_chunks_backup_idx ON guild_backup_chunks(backup_id,chunk_index)",
   `CREATE TABLE IF NOT EXISTS guild_restore_jobs (
     id TEXT PRIMARY KEY,
     backup_id TEXT NOT NULL,
     target_guild_id TEXT NOT NULL,
     status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    role_map_json TEXT NOT NULL DEFAULT '{}',
+    channel_map_json TEXT NOT NULL DEFAULT '{}',
+    vm_map_json TEXT NOT NULL DEFAULT '{}',
+    product_map_json TEXT NOT NULL DEFAULT '{}',
     result_json TEXT NOT NULL DEFAULT '{}',
     error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
-  `CREATE INDEX IF NOT EXISTS guild_restore_jobs_target_idx ON guild_restore_jobs(target_guild_id, created_at DESC)`,
+  "CREATE INDEX IF NOT EXISTS guild_restore_jobs_status_idx ON guild_restore_jobs(status,updated_at)",
+  `CREATE TABLE IF NOT EXISTS member_recovery_states (
+    state TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS member_recovery_oauth_states (
+    state TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    expected_user_id TEXT,
+    purpose TEXT NOT NULL DEFAULT 'manual',
+    expires_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS member_recovery_tokens (
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    access_token_enc TEXT NOT NULL,
+    refresh_token_enc TEXT NOT NULL,
+    token_expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(guild_id,user_id)
+  )`,
+  "CREATE INDEX IF NOT EXISTS member_recovery_tokens_guild_idx ON member_recovery_tokens(guild_id,revoked_at)",
+  `CREATE TABLE IF NOT EXISTS panel_deployments (
+    guild_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    object_id TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL,
+    message_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(guild_id,kind,object_id)
+  )`
 ];
 
-function randomId(): string {
-  return crypto.randomUUID().replace(/-/g, "");
+const initializations = new WeakMap<D1Database,Promise<void>>();
+
+// CC-server 移行: 旧CC-serverのバックアップ表 (平文 payload 形式) は列構成が異なり、
+// CREATE TABLE IF NOT EXISTS では新形式に置き換わらない。旧表は削除せず
+// legacy_cc_* へ退避し、新しい表を作成できるようにする。
+async function tableColumns(env:Env,table:string):Promise<Set<string>>{
+  const {results}=await env.DB.prepare(`PRAGMA table_info(${table})`).all<{name:string}>();
+  return new Set((results??[]).map(row=>String(row.name)));
 }
 
-export type BackupRow = {
-  id: string;
-  source_guild_id: string;
-  source_guild_name: string;
-  label: string | null;
-  created_at: number;
-  payload: string;
-  role_count: number;
-  channel_count: number;
-  member_count: number;
-  warnings_json: string;
+async function migrateLegacyCcServerBackupTables(env:Env):Promise<void>{
+  const backups=await tableColumns(env,"guild_backups");
+  if(backups.size&&!backups.has("payload_enc")){
+    await env.DB.batch([
+      env.DB.prepare("DROP INDEX IF EXISTS guild_backups_source_idx"),
+      env.DB.prepare("ALTER TABLE guild_backups RENAME TO legacy_cc_guild_backups")
+    ]);
+  }
+  const jobs=await tableColumns(env,"guild_restore_jobs");
+  if(jobs.size&&!jobs.has("phase")){
+    await env.DB.batch([
+      env.DB.prepare("DROP INDEX IF EXISTS guild_restore_jobs_target_idx"),
+      env.DB.prepare("ALTER TABLE guild_restore_jobs RENAME TO legacy_cc_guild_restore_jobs")
+    ]);
+  }
+}
+
+export async function ensureBackupSchema(env:Env):Promise<void>{
+  let pending=initializations.get(env.DB);
+  if(!pending){
+    pending=(async()=>{
+      await migrateLegacyCcServerBackupTables(env);
+      for(const sql of schema) await env.DB.prepare(sql).run();
+    })();
+    initializations.set(env.DB,pending);
+    pending.catch(()=>initializations.delete(env.DB));
+  }
+  await pending;
+}
+
+export async function createBackupRecord(
+  env:Env,
+  input:{
+    sourceGuildId:string;
+    sourceGuildName:string;
+    label?:string|null;
+    payloadEnc:string;
+    roleCount:number;
+    channelCount:number;
+    memberCount:number;
+    recoveryMemberCount:number;
+    warnings:string[];
+  }
+):Promise<BackupRow>{
+  await ensureBackupSchema(env);
+  const id=randomId();
+  const now=Date.now();
+  const marker="chunked:v1";
+  const statements:D1PreparedStatement[]=[env.DB.prepare(`
+    INSERT INTO guild_backups(
+      id,source_guild_id,source_guild_name,label,created_at,schema_version,payload_enc,
+      role_count,channel_count,member_count,recovery_member_count,warnings_json
+    ) VALUES (?,?,?,?,?,2,?,?,?,?,?,?)
+  `).bind(
+    id,input.sourceGuildId,input.sourceGuildName,input.label??null,now,marker,
+    input.roleCount,input.channelCount,input.memberCount,input.recoveryMemberCount,
+    JSON.stringify(input.warnings)
+  )];
+  const chunkSize=120_000;
+  for(let offset=0,index=0;offset<input.payloadEnc.length;offset+=chunkSize,index++){
+    statements.push(env.DB.prepare(
+        "INSERT INTO guild_backup_chunks(backup_id,chunk_index,payload_chunk) VALUES (?,?,?)"
+    ).bind(id,index,input.payloadEnc.slice(offset,offset+chunkSize)));
+  }
+  // A failed chunk must not leave a visible, incomplete backup.
+  await env.DB.batch(statements);
+
+  return (await getBackupRecord(env,id))!;
+}
+
+export async function getBackupPayload(env:Env,row:BackupRow):Promise<string>{
+  await ensureBackupSchema(env);
+  if(row.payload_enc!=="chunked:v1") return row.payload_enc;
+  const chunks=(await env.DB.prepare(
+    "SELECT payload_chunk FROM guild_backup_chunks WHERE backup_id=? ORDER BY chunk_index ASC"
+  ).bind(row.id).all<{payload_chunk:string}>()).results;
+  if(!chunks.length) throw new Error("Backup payload chunks are missing");
+  return chunks.map(chunk=>chunk.payload_chunk).join("");
+}
+
+export async function listBackupRecords(env:Env,guildId?:string):Promise<BackupRow[]>{
+  await ensureBackupSchema(env);
+  if(guildId){
+    return (await env.DB.prepare(
+      "SELECT * FROM guild_backups WHERE source_guild_id=? ORDER BY created_at DESC LIMIT 100"
+    ).bind(guildId).all<BackupRow>()).results;
+  }
+  return (await env.DB.prepare(
+    "SELECT * FROM guild_backups ORDER BY created_at DESC LIMIT 200"
+  ).all<BackupRow>()).results;
+}
+
+export async function getBackupRecord(env:Env,id:string):Promise<BackupRow|null>{
+  await ensureBackupSchema(env);
+  return await env.DB.prepare("SELECT * FROM guild_backups WHERE id=?")
+    .bind(id).first<BackupRow>()??null;
+}
+
+export async function deleteBackupRecord(env:Env,id:string):Promise<boolean>{
+  await ensureBackupSchema(env);
+  const active=await env.DB.prepare("SELECT id FROM guild_restore_jobs WHERE backup_id=? AND status IN ('queued','running') LIMIT 1").bind(id).first();
+  if(active) return false;
+  const results=await env.DB.batch([
+    env.DB.prepare("DELETE FROM guild_backups WHERE id=? AND NOT EXISTS (SELECT 1 FROM guild_restore_jobs WHERE backup_id=? AND status IN ('queued','running'))").bind(id,id),
+    env.DB.prepare("DELETE FROM guild_backup_chunks WHERE backup_id=? AND NOT EXISTS (SELECT 1 FROM guild_backups WHERE id=?)").bind(id,id)
+  ]);
+  return (results[0]!.meta.changes??0)>0;
+}
+
+export type RecoveryOAuthState = {
+  guildId:string;
+  expectedUserId:string|null;
+  purpose:"manual"|"verification";
 };
 
-export async function createBackupRecord(env: Env, data: {
-  sourceGuildId: string; sourceGuildName: string; label: string | null; payload: string;
-  roleCount: number; channelCount: number; memberCount: number; warnings: string[];
-}): Promise<BackupRow> {
-  const id = randomId();
-  const row: BackupRow = {
-    id, source_guild_id: data.sourceGuildId, source_guild_name: data.sourceGuildName,
-    label: data.label, created_at: Date.now(), payload: data.payload,
-    role_count: data.roleCount, channel_count: data.channelCount, member_count: data.memberCount,
-    warnings_json: JSON.stringify(data.warnings),
-  };
+export async function cleanExpiredRecoveryOAuthStates(env:Env):Promise<void>{
+  await ensureBackupSchema(env);
+  const now=Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      "DELETE FROM member_recovery_oauth_states WHERE expires_at<?"
+    ).bind(now),
+    env.DB.prepare(
+      "DELETE FROM member_recovery_states WHERE expires_at<?"
+    ).bind(now)
+  ]);
+}
+
+export async function putRecoveryOAuthState(
+  env:Env,
+  state:string,
+  guildId:string,
+  options?:{expectedUserId?:string|null;purpose?:"manual"|"verification"}
+):Promise<void>{
+  await ensureBackupSchema(env);
   await env.DB.prepare(
-    `INSERT INTO guild_backups(id,source_guild_id,source_guild_name,label,created_at,payload,role_count,channel_count,member_count,warnings_json)
-     VALUES(?,?,?,?,?,?,?,?,?,?)`
-  ).bind(row.id, row.source_guild_id, row.source_guild_name, row.label, row.created_at, row.payload, row.role_count, row.channel_count, row.member_count, row.warnings_json).run();
-  return row;
+    `INSERT INTO member_recovery_oauth_states(
+      state,guild_id,expected_user_id,purpose,expires_at
+    ) VALUES (?,?,?,?,?)`
+  ).bind(
+    state,
+    guildId,
+    options?.expectedUserId??null,
+    options?.purpose??"manual",
+    Date.now()+10*60_000
+  ).run();
 }
 
-export async function listBackupRecords(env: Env): Promise<BackupRow[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT id,source_guild_id,source_guild_name,label,created_at,role_count,channel_count,member_count,warnings_json FROM guild_backups ORDER BY created_at DESC LIMIT 100`
-  ).all<Omit<BackupRow, "payload">>();
-  return results.map(r => ({ ...r, payload: "" }));
+export async function consumeRecoveryOAuthState(
+  env:Env,state:string
+):Promise<RecoveryOAuthState|null>{
+  await ensureBackupSchema(env);
+  const row=await env.DB.prepare(
+    `SELECT guild_id,expected_user_id,purpose
+     FROM member_recovery_oauth_states
+     WHERE state=? AND expires_at>?`
+  ).bind(state,Date.now()).first<{
+    guild_id:string;
+    expected_user_id:string|null;
+    purpose:string;
+  }>();
+  if(row){
+    await env.DB.prepare(
+      "DELETE FROM member_recovery_oauth_states WHERE state=?"
+    ).bind(state).run();
+    return {
+      guildId:row.guild_id,
+      expectedUserId:row.expected_user_id,
+      purpose:row.purpose==="verification"?"verification":"manual"
+    };
+  }
+
+  // Backward compatibility for recovery links created before this schema.
+  const legacy=await env.DB.prepare(
+    "SELECT guild_id FROM member_recovery_states WHERE state=? AND expires_at>?"
+  ).bind(state,Date.now()).first<{guild_id:string}>();
+  if(!legacy) return null;
+  await env.DB.prepare("DELETE FROM member_recovery_states WHERE state=?").bind(state).run();
+  return {guildId:legacy.guild_id,expectedUserId:null,purpose:"manual"};
 }
 
-export async function getBackupRecord(env: Env, id: string): Promise<BackupRow | null> {
-  return env.DB.prepare(`SELECT * FROM guild_backups WHERE id=?`).bind(id).first<BackupRow>();
+export async function putRecoveryState(env:Env,state:string,guildId:string):Promise<void>{
+  return putRecoveryOAuthState(env,state,guildId,{purpose:"manual"});
 }
 
-export async function deleteBackupRecord(env: Env, id: string): Promise<void> {
-  await env.DB.prepare(`DELETE FROM guild_backups WHERE id=?`).bind(id).run();
+export async function consumeRecoveryState(env:Env,state:string):Promise<string|null>{
+  const row=await consumeRecoveryOAuthState(env,state);
+  return row?.guildId??null;
 }
 
-export type RestoreJobRow = {
-  id: string;
-  backup_id: string;
-  target_guild_id: string;
-  status: "running" | "completed" | "failed" | "cancelled";
-  result_json: string;
-  error: string | null;
-  created_at: number;
-  updated_at: number;
-};
+export async function upsertRecoveryMember(
+  env:Env,
+  row:{
+    guildId:string;
+    userId:string;
+    username:string;
+    accessTokenEnc:string;
+    refreshTokenEnc:string;
+    tokenExpiresAt:number;
+  }
+):Promise<void>{
+  await ensureBackupSchema(env);
+  const now=Date.now();
+  await env.DB.prepare(`
+    INSERT INTO member_recovery_tokens(
+      guild_id,user_id,username,access_token_enc,refresh_token_enc,token_expires_at,
+      revoked_at,created_at,updated_at
+    ) VALUES (?,?,?,?,?,?,NULL,?,?)
+    ON CONFLICT(guild_id,user_id) DO UPDATE SET
+      username=excluded.username,
+      access_token_enc=excluded.access_token_enc,
+      refresh_token_enc=excluded.refresh_token_enc,
+      token_expires_at=excluded.token_expires_at,
+      revoked_at=NULL,
+      updated_at=excluded.updated_at
+  `).bind(
+    row.guildId,row.userId,row.username,row.accessTokenEnc,row.refreshTokenEnc,
+    row.tokenExpiresAt,now,now
+  ).run();
+}
 
-export async function createRestoreJob(env: Env, backupId: string, targetGuildId: string): Promise<RestoreJobRow> {
-  const id = randomId();
-  const now = Date.now();
-  const row: RestoreJobRow = { id, backup_id: backupId, target_guild_id: targetGuildId, status: "running", result_json: "{}", error: null, created_at: now, updated_at: now };
+export async function getRecoveryMember(
+  env:Env,guildId:string,userId:string
+):Promise<RecoveryMemberRow|null>{
+  await ensureBackupSchema(env);
+  return await env.DB.prepare(
+    "SELECT * FROM member_recovery_tokens WHERE guild_id=? AND user_id=?"
+  ).bind(guildId,userId).first<RecoveryMemberRow>()??null;
+}
+
+export async function listRecoveryMembers(
+  env:Env,guildId:string,afterUserId?:string,limit=25
+):Promise<RecoveryMemberRow[]>{
+  await ensureBackupSchema(env);
+  if(afterUserId){
+    return (await env.DB.prepare(`
+      SELECT * FROM member_recovery_tokens
+      WHERE guild_id=? AND revoked_at IS NULL AND user_id>?
+      ORDER BY user_id ASC LIMIT ?
+    `).bind(guildId,afterUserId,limit).all<RecoveryMemberRow>()).results;
+  }
+  return (await env.DB.prepare(`
+    SELECT * FROM member_recovery_tokens
+    WHERE guild_id=? AND revoked_at IS NULL
+    ORDER BY user_id ASC LIMIT ?
+  `).bind(guildId,limit).all<RecoveryMemberRow>()).results;
+}
+
+export async function countRecoveryMembers(env:Env,guildId:string):Promise<number>{
+  await ensureBackupSchema(env);
+  const row=await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM member_recovery_tokens WHERE guild_id=? AND revoked_at IS NULL"
+  ).bind(guildId).first<{count:number}>();
+  return Number(row?.count??0);
+}
+
+export async function rotateRecoveryMember(
+  env:Env,
+  guildId:string,
+  userId:string,
+  accessTokenEnc:string,
+  refreshTokenEnc:string,
+  tokenExpiresAt:number
+):Promise<void>{
+  await ensureBackupSchema(env);
+  await env.DB.prepare(`
+    UPDATE member_recovery_tokens SET
+      access_token_enc=?,refresh_token_enc=?,token_expires_at=?,revoked_at=NULL,updated_at=?
+    WHERE guild_id=? AND user_id=?
+  `).bind(
+    accessTokenEnc,refreshTokenEnc,tokenExpiresAt,Date.now(),guildId,userId
+  ).run();
+}
+
+export async function markRecoveryMemberRevoked(
+  env:Env,guildId:string,userId:string
+):Promise<void>{
+  await ensureBackupSchema(env);
   await env.DB.prepare(
-    `INSERT INTO guild_restore_jobs(id,backup_id,target_guild_id,status,result_json,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`
-  ).bind(row.id, row.backup_id, row.target_guild_id, row.status, row.result_json, row.error, row.created_at, row.updated_at).run();
-  return row;
+    "UPDATE member_recovery_tokens SET revoked_at=?,updated_at=? WHERE guild_id=? AND user_id=?"
+  ).bind(Date.now(),Date.now(),guildId,userId).run();
 }
 
-export async function getRestoreJob(env: Env, id: string): Promise<RestoreJobRow | null> {
-  return env.DB.prepare(`SELECT * FROM guild_restore_jobs WHERE id=?`).bind(id).first<RestoreJobRow>();
+export async function createRestoreJob(
+  env:Env,backupId:string,targetGuildId:string,workerOrigin:string
+):Promise<RestoreJobRow|null>{
+  await ensureBackupSchema(env);
+  const existing=await env.DB.prepare(`
+    SELECT * FROM guild_restore_jobs
+    WHERE target_guild_id=? AND status IN ('queued','running')
+    ORDER BY created_at DESC LIMIT 1
+  `).bind(targetGuildId).first<RestoreJobRow>();
+  if(existing){
+    let result:Record<string,unknown>={};
+    try{result=JSON.parse(existing.result_json||"{}") as Record<string,unknown>;}catch{}
+    if(!result.workerOrigin){
+      result.workerOrigin=workerOrigin;
+      await env.DB.prepare(
+        "UPDATE guild_restore_jobs SET result_json=?,updated_at=? WHERE id=? AND status IN ('queued','running')"
+      ).bind(JSON.stringify(result),Date.now(),existing.id).run();
+      existing.result_json=JSON.stringify(result);
+    }
+    return existing;
+  }
+
+  const id=randomId(),now=Date.now();
+  const resultJson=JSON.stringify({workerOrigin});
+  await env.DB.prepare(`
+    INSERT INTO guild_restore_jobs(
+      id,backup_id,target_guild_id,status,phase,cursor,role_map_json,channel_map_json,
+      vm_map_json,product_map_json,result_json,error,created_at,updated_at
+    ) SELECT ?,?,?,'queued','preflight',0,'{}','{}','{}','{}',?,NULL,?,?
+    WHERE EXISTS (SELECT 1 FROM guild_backups WHERE id=?)
+      AND NOT EXISTS (SELECT 1 FROM guild_restore_jobs WHERE target_guild_id=? AND status IN ('queued','running'))
+  `).bind(id,backupId,targetGuildId,resultJson,now,now,backupId,targetGuildId).run();
+  return (await env.DB.prepare("SELECT * FROM guild_restore_jobs WHERE target_guild_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1").bind(targetGuildId).first<RestoreJobRow>())!;
 }
 
-export async function listRestoreJobsForGuild(env: Env, targetGuildId: string): Promise<RestoreJobRow[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT * FROM guild_restore_jobs WHERE target_guild_id=? ORDER BY created_at DESC LIMIT 20`
-  ).bind(targetGuildId).all<RestoreJobRow>();
-  return results;
+export async function getRestoreJob(env:Env,id:string):Promise<RestoreJobRow|null>{
+  await ensureBackupSchema(env);
+  return await env.DB.prepare("SELECT * FROM guild_restore_jobs WHERE id=?")
+    .bind(id).first<RestoreJobRow>()??null;
 }
 
-export async function updateRestoreJob(env: Env, id: string, patch: Partial<Pick<RestoreJobRow, "status" | "result_json" | "error">>): Promise<void> {
-  const keys = Object.keys(patch);
-  if (!keys.length) return;
-  const set = [...keys.map(k => `${k}=?`), "updated_at=?"].join(",");
-  const vals = [...keys.map(k => (patch as any)[k]), Date.now()];
-  await env.DB.prepare(`UPDATE guild_restore_jobs SET ${set} WHERE id=?`).bind(...vals, id).run();
+export async function listRestoreJobs(env:Env,targetGuildId?:string):Promise<RestoreJobRow[]>{
+  await ensureBackupSchema(env);
+  if(targetGuildId){
+    return (await env.DB.prepare(
+      "SELECT * FROM guild_restore_jobs WHERE target_guild_id=? ORDER BY created_at DESC LIMIT 20"
+    ).bind(targetGuildId).all<RestoreJobRow>()).results;
+  }
+  return (await env.DB.prepare(
+    "SELECT * FROM guild_restore_jobs ORDER BY created_at DESC LIMIT 50"
+  ).all<RestoreJobRow>()).results;
 }
 
-// Marks a still-running job as cancelled. runRestore() polls this status
-// between phases and stops early once it sees it — there is no way to abort
-// an in-flight Discord API call, so cancellation takes effect at the next
-// phase boundary (role/channel/position/extras/bans/members), not instantly.
-export async function cancelRestoreJob(env: Env, id: string): Promise<boolean> {
-  const result = await env.DB.prepare(
-    `UPDATE guild_restore_jobs SET status='cancelled', updated_at=? WHERE id=? AND status='running'`
-  ).bind(Date.now(), id).run();
-  return (result.meta.changes ?? 0) > 0;
+export async function nextRestoreJob(env:Env):Promise<RestoreJobRow|null>{
+  await ensureBackupSchema(env);
+  return await env.DB.prepare(`
+    SELECT * FROM guild_restore_jobs
+    WHERE status IN ('queued','running')
+    ORDER BY created_at ASC LIMIT 1
+  `).first<RestoreJobRow>()??null;
+}
+
+export async function updateRestoreJob(
+  env:Env,
+  id:string,
+  patch:Partial<Pick<
+    RestoreJobRow,
+    "status"|"phase"|"cursor"|"role_map_json"|"channel_map_json"|
+    "vm_map_json"|"product_map_json"|"result_json"|"error"
+  >>
+):Promise<void>{
+  await ensureBackupSchema(env);
+  const current=await getRestoreJob(env,id);
+  if(!current) return;
+  await env.DB.prepare(`
+    UPDATE guild_restore_jobs SET
+      status=?,phase=?,cursor=?,role_map_json=?,channel_map_json=?,
+      vm_map_json=?,product_map_json=?,result_json=?,error=?,updated_at=?
+    WHERE id=? AND status IN ('queued','running')
+  `).bind(
+    patch.status??current.status,
+    patch.phase??current.phase,
+    patch.cursor??current.cursor,
+    patch.role_map_json??current.role_map_json,
+    patch.channel_map_json??current.channel_map_json,
+    patch.vm_map_json??current.vm_map_json,
+    patch.product_map_json??current.product_map_json,
+    patch.result_json??current.result_json,
+    patch.error===undefined?current.error:patch.error,
+    Date.now(),id
+  ).run();
+}
+
+export async function cancelRestoreJob(env:Env,id:string):Promise<boolean>{
+  await ensureBackupSchema(env);
+  const result=await env.DB.prepare(`
+    UPDATE guild_restore_jobs
+    SET status='cancelled',updated_at=?
+    WHERE id=? AND status IN ('queued','running')
+  `).bind(Date.now(),id).run();
+  return (result.meta.changes??0)>0;
+}
+
+export async function recordPanelDeployment(
+  env:Env,
+  input:{guildId:string;kind:string;objectId?:string;channelId:string;messageId?:string|null}
+):Promise<void>{
+  await ensureBackupSchema(env);
+  const now=Date.now();
+  await env.DB.prepare(`
+    INSERT INTO panel_deployments(
+      guild_id,kind,object_id,channel_id,message_id,created_at,updated_at
+    ) VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(guild_id,kind,object_id) DO UPDATE SET
+      channel_id=excluded.channel_id,
+      message_id=excluded.message_id,
+      updated_at=excluded.updated_at
+  `).bind(
+    input.guildId,input.kind,input.objectId??"",input.channelId,input.messageId??null,now,now
+  ).run();
+}
+
+export async function listPanelDeployments(
+  env:Env,guildId:string
+):Promise<PanelDeploymentRow[]>{
+  await ensureBackupSchema(env);
+  return (await env.DB.prepare(
+    "SELECT * FROM panel_deployments WHERE guild_id=? ORDER BY created_at ASC"
+  ).bind(guildId).all<PanelDeploymentRow>()).results;
 }

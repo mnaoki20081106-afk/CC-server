@@ -1,0 +1,1749 @@
+import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign as signMessage } from 'node:crypto';
+import { test } from 'node:test';
+import { Miniflare } from 'miniflare';
+
+const guildId = '123456789012345678';
+const botId = '223456789012345678';
+const verificationUserId = '323456789012345679';
+const bannedUserId = '323456789012345680';
+const botRoleId = '623456789012345678';
+const targetRoleId = '523456789012345678';
+const chatChannelId = '423456789012345678';
+const guild = { id: guildId, name: 'Regression server', icon: null };
+const nonAdminBotPermissions = (
+  1n|32n|1024n|2048n|16384n|32768n|65536n|8192n|16n|134217728n|268435456n|
+  2n|4n|1099511627776n|128n
+).toString();
+
+async function runtime(t, options = {}) {
+  const calls = [];
+  const {privateKey:interactionPrivateKey,publicKey:interactionPublicKey} =
+    generateKeyPairSync('ed25519');
+  const publicKeyDer = interactionPublicKey.export({format:'der',type:'spki'});
+  const discordPublicKey = Buffer.from(publicKeyDer).subarray(-32).toString('hex');
+  let verificationMemberRoles = [...(options.verificationMemberRoles ?? [])];
+  let verificationMemberLookups = 0;
+  let memberAddAttempts = 0;
+  let rateLimitGuild = true;
+  let guildListCalls = 0;
+  let chatChannelName = options.chatChannelName ?? 'chat';
+  const botPermissions = options.botPermissions ?? nonAdminBotPermissions;
+  const botRolePosition = options.botRolePosition ?? 2;
+  const targetRolePosition = options.targetRolePosition ?? 1;
+  let channelOverwrites = [...(options.channelOverwrites ?? [])];
+  const forceBotOverwrite403 = options.forceBotOverwrite403 ?? false;
+  const forceVerificationRole403 = options.forceVerificationRole403 ?? false;
+  const mf = new Miniflare({
+    modules: true,
+    scriptPath: '.test-worker/index.js',
+    // Latest stable Miniflare 4 runtime; production keeps its newer date.
+    compatibilityDate: '2026-08-06',
+    compatibilityFlags: ['nodejs_compat'],
+    d1Databases: ['DB'],
+    bindings: {
+      DISCORD_BOT_TOKEN: 'local-test-token', DISCORD_APPLICATION_ID: botId,
+      DISCORD_PUBLIC_KEY: discordPublicKey,
+      DASHBOARD_PASSWORD: 'local-test-password', SESSION_ENCRYPTION_KEY: 'local-test-key-not-for-production',
+      WEB_ORIGIN: 'https://dashboard.example', WEB_PUBLIC_URL: 'https://dashboard.example/', PAYPAY_ENV: 'sandbox',
+      ...(options.discordOAuthRedirectUri ? {DISCORD_OAUTH_REDIRECT_URI: options.discordOAuthRedirectUri} : {})
+    },
+    outboundService: async request => {
+      const url = new URL(request.url);
+      calls.push({ method: request.method, path: url.pathname });
+      assert.equal(url.hostname, 'discord.com', 'tests must never contact payment providers');
+      if (
+        request.method === 'POST' &&
+        url.pathname === '/api/v10/oauth2/token'
+      ) {
+        const form = new URLSearchParams(await request.clone().text());
+        calls[calls.length-1].body=Object.fromEntries(form.entries());
+        const refresh=form.get('grant_type')==='refresh_token';
+        return Response.json({
+          access_token:refresh?'refreshed-access-token':'verification-access-token',
+          refresh_token:refresh?'rotated-refresh-token':'verification-refresh-token',
+          expires_in:options.oauthExpiresIn ?? 3600
+        });
+      }
+      if (url.pathname.endsWith('/users/@me')) {
+        const auth=request.headers.get('Authorization') ?? '';
+        if (auth.startsWith('Bearer ')) {
+          return Response.json({
+            id:verificationUserId,
+            username:'Verifier',
+            global_name:'Verifier'
+          });
+        }
+        return Response.json({id:botId,username:'Test bot'});
+      }
+      if (url.pathname.endsWith('/users/@me/guilds')) {
+        guildListCalls++;
+        if (options.guildListFailureAfterFirst && guildListCalls > 1) {
+          return Response.json({ retry_after: 0.001 }, {status: 429});
+        }
+        if (options.guildListAlwaysEmpty) return Response.json([]);
+        return Response.json([guild]);
+      }
+      if (url.pathname === `/api/v10/guilds/${guildId}`) {
+        if (rateLimitGuild) { rateLimitGuild = false; return Response.json({ retry_after: 0.001 }, {status: 429}); }
+        return Response.json(guild);
+      }
+      if (url.pathname.endsWith('/channels')) return Response.json([
+        {id:'323456789012345678',name:'General',type:4,position:0},
+        {
+          id:chatChannelId,
+          name:chatChannelName,
+          type:0,
+          parent_id:'323456789012345678',
+          position:1,
+          permission_overwrites:channelOverwrites
+        }
+      ]);
+      if (url.pathname.endsWith('/roles')) return Response.json([
+        {id:guildId,name:'@everyone',position:0,managed:false,permissions:'0'},
+        {id:targetRoleId,name:'Customer',position:targetRolePosition,managed:false,permissions:'0'},
+        {
+          id:botRoleId,
+          name:'Test bot',
+          position:botRolePosition,
+          managed:true,
+          permissions:botPermissions,
+          tags:{bot_id:botId}
+        }
+      ]);
+      if (url.pathname === `/api/v10/guilds/${guildId}/emojis`) return Response.json([]);
+      if (url.pathname === `/api/v10/guilds/${guildId}/stickers`) return Response.json([]);
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/guilds/${guildId}/bans`
+      ) {
+        return Response.json([{
+          user:{id:bannedUserId,username:'BlockedUser',global_name:'Blocked User'},
+          reason:'Regression ban'
+        }]);
+      }
+      if (
+        request.method === 'PUT' &&
+        url.pathname === `/api/v10/guilds/${guildId}/bans/${bannedUserId}`
+      ) {
+        return new Response(null,{status:204});
+      }
+      if (url.pathname === `/api/v10/guilds/${guildId}/welcome-screen`) {
+        if (request.method === 'PATCH') {
+          return Response.json(await request.clone().json());
+        }
+        return Response.json({
+          description:'Welcome to the regression server',
+          welcome_channels:[{
+            channel_id:chatChannelId,
+            description:'Start here',
+            emoji_id:null,
+            emoji_name:'👋'
+          }]
+        });
+      }
+      if (url.pathname === `/api/v10/guilds/${guildId}/widget`) {
+        if (request.method === 'PATCH') {
+          return Response.json(await request.clone().json());
+        }
+        return Response.json({enabled:true,channel_id:chatChannelId});
+      }
+      if (
+        request.method === 'PATCH' &&
+        /^\/api\/v10\/guilds\/\d+\/roles\/\d+$/.test(url.pathname)
+      ) {
+        const id=url.pathname.split('/').at(-1);
+        const body=await request.clone().json().catch(()=>({}));
+        return Response.json({
+          id,
+          name:id===targetRoleId?'Customer':'@everyone',
+          position:id===targetRoleId?targetRolePosition:0,
+          managed:false,
+          permissions:String(body.permissions??'0'),
+          color:Number(body.color??0),
+          hoist:Boolean(body.hoist),
+          mentionable:Boolean(body.mentionable)
+        });
+      }
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/guilds/${guildId}/members`
+      ) {
+        return Response.json([{
+          user:{id:verificationUserId,username:'Verifier',global_name:'Verifier',bot:false},
+          nick:'Recovery Tester',
+          roles:[targetRoleId],
+          joined_at:'2026-01-01T00:00:00.000Z',
+          communication_disabled_until:'2099-01-01T00:00:00.000Z'
+        }]);
+      }
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/channels/${chatChannelId}`
+      ) {
+        return Response.json({id:chatChannelId,guild_id:guildId,name:chatChannelName,type:0});
+      }
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/channels/${chatChannelId}/messages`
+      ) {
+        return Response.json([]);
+      }
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/channels/${chatChannelId}/messages/723456789012345678`
+      ) {
+        return Response.json({
+          id:'723456789012345678',
+          channel_id:chatChannelId,
+          components:[{type:1,components:[{
+            type:2,style:3,label:'認証する',custom_id:`verify:start:${guildId}`
+          }]}]
+        });
+      }
+      if (
+        request.method === 'PATCH' &&
+        url.pathname === `/api/v10/channels/${chatChannelId}/messages/723456789012345678`
+      ) {
+        calls[calls.length-1].body=await request.clone().json().catch(()=>null);
+        return Response.json({
+          id:'723456789012345678',
+          channel_id:chatChannelId,
+          ...calls[calls.length-1].body
+        });
+      }
+      if (
+        request.method === 'POST' &&
+        url.pathname === `/api/v10/channels/${chatChannelId}/messages`
+      ) {
+        calls[calls.length-1].body=await request.clone().json().catch(()=>null);
+        return Response.json({id:'723456789012345678',channel_id:chatChannelId},{status:200});
+      }
+      if (
+        request.method === 'GET' &&
+        url.pathname === `/api/v10/guilds/${guildId}/members/${verificationUserId}`
+      ) {
+        verificationMemberLookups++;
+        if (
+          Number.isInteger(options.verificationMemberMissingAfter) &&
+          verificationMemberLookups > options.verificationMemberMissingAfter
+        ) {
+          return Response.json({message:'Unknown Member',code:10007},{status:404});
+        }
+        return Response.json({roles:[...verificationMemberRoles]});
+      }
+      if (
+        request.method === 'PUT' &&
+        url.pathname === `/api/v10/guilds/${guildId}/members/${verificationUserId}`
+      ) {
+        memberAddAttempts++;
+        calls[calls.length-1].body=await request.clone().json().catch(()=>null);
+        if (options.memberAddInvalidTokenOnce && memberAddAttempts===1) {
+          return Response.json({
+            message:'Invalid OAuth2 access token provided',
+            code:50025
+          },{status:403});
+        }
+        if (options.memberAddFailureCode) {
+          return Response.json({
+            message:'Member cannot join',
+            code:options.memberAddFailureCode
+          },{status:options.memberAddFailureStatus ?? 403});
+        }
+        return Response.json({
+          user:{id:verificationUserId,username:'Verifier'},
+          roles:[]
+        },{status:201});
+      }
+      if (
+        request.method === 'PUT' &&
+        url.pathname === `/api/v10/guilds/${guildId}/members/${verificationUserId}/roles/${targetRoleId}`
+      ) {
+        if (forceVerificationRole403) {
+          return Response.json({message:'Missing Permissions',code:50013},{status:403});
+        }
+        if (!verificationMemberRoles.includes(targetRoleId)) {
+          verificationMemberRoles.push(targetRoleId);
+        }
+        return new Response(null,{status:204});
+      }
+      if (
+        request.method === 'PUT' &&
+        /^\/api\/v10\/channels\/\d+\/permissions\/\d+$/.test(url.pathname)
+      ) {
+        if (forceBotOverwrite403 && url.pathname.endsWith(`/permissions/${botId}`)) {
+          return Response.json({message:'Missing Access',code:50001},{status:403});
+        }
+        const parts = url.pathname.split('/');
+        const channelId = parts[4];
+        const overwriteId = parts[6];
+        if (channelId === chatChannelId) {
+          const body = await request.clone().json();
+          channelOverwrites = [
+            ...channelOverwrites.filter(
+              overwrite => !(overwrite.id === overwriteId && overwrite.type === body.type)
+            ),
+            {
+              id: overwriteId,
+              type: body.type,
+              allow: String(body.allow ?? '0'),
+              deny: String(body.deny ?? '0')
+            }
+          ];
+        }
+        return new Response(null,{status:204});
+      }
+      if (
+        request.method === 'DELETE' &&
+        /^\/api\/v10\/channels\/\d+\/permissions\/\d+$/.test(url.pathname)
+      ) {
+        const parts = url.pathname.split('/');
+        const channelId = parts[4];
+        const overwriteId = parts[6];
+        if (channelId === chatChannelId) {
+          channelOverwrites = channelOverwrites.filter(overwrite => overwrite.id !== overwriteId);
+        }
+        return new Response(null,{status:204});
+      }
+      if (
+        request.method === 'PATCH' &&
+        /^\/api\/v10\/channels\/\d+$/.test(url.pathname)
+      ) {
+        const id = url.pathname.split('/').at(-1);
+        const body = await request.clone().json().catch(() => ({}));
+        calls[calls.length-1].body=body;
+        if (id === chatChannelId && Array.isArray(body.permission_overwrites)) {
+          channelOverwrites = body.permission_overwrites.map(overwrite => ({
+            id:String(overwrite.id),
+            type:Number(overwrite.type),
+            allow:String(overwrite.allow ?? '0'),
+            deny:String(overwrite.deny ?? '0')
+          }));
+        }
+        if (id === chatChannelId && typeof body.name === 'string') {
+          chatChannelName = body.name;
+        }
+        return Response.json({
+          id,
+          name:id===chatChannelId?chatChannelName:'General',
+          type:id===chatChannelId?0:4,
+          permission_overwrites:id===chatChannelId?channelOverwrites:[]
+        });
+      }
+      if (
+        request.method === 'PATCH' &&
+        /^\/api\/v10\/webhooks\/\d+\/[^/]+\/messages\/@original$/.test(url.pathname)
+      ) {
+        calls[calls.length-1].body=await request.clone().json().catch(()=>null);
+        return Response.json({
+          id:'823456789012345678',
+          ...calls[calls.length-1].body
+        });
+      }
+      return Response.json({message:'Missing Access'}, {status:403});
+    }
+  });
+  t.after(() => mf.dispose());
+  return {
+    mf,
+    calls,
+    db:await mf.getD1Database('DB'),
+    interactionPrivateKey,
+    verificationMemberRoles
+  };
+}
+
+async function request(mf, path, token, method = 'GET', body) {
+  const response = await mf.dispatchFetch('https://worker.example' + path, {
+    method,
+    headers: {'Content-Type':'application/json', ...(token ? {Authorization:`Bearer ${token}`} : {})},
+    ...(body === undefined ? {} : {body: JSON.stringify(body)})
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+async function signedInteraction(mf, privateKey, payload) {
+  const body = JSON.stringify(payload);
+  const timestamp = String(Math.floor(Date.now()/1000));
+  const signature = signMessage(
+    null,
+    Buffer.from(timestamp + body),
+    privateKey
+  ).toString('hex');
+  const response = await mf.dispatchFetch('https://worker.example/interactions', {
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'X-Signature-Ed25519':signature,
+      'X-Signature-Timestamp':timestamp
+    },
+    body
+  });
+  return {status:response.status,body:await response.json()};
+}
+
+async function eventually(fn, timeoutMs=1500) {
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){
+    const value=await fn();
+    if(value) return value;
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+  return fn();
+}
+
+test('guild list recovers configured servers when Discord returns a suspicious empty list', async t => {
+  const {mf} = await runtime(t, {guildListAlwaysEmpty:true});
+  const login = await request(mf, '/api/login', null, 'POST', {password:'local-test-password'});
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const saved=await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {spamMax:7}
+  );
+  assert.equal(saved.status,200,JSON.stringify(saved.body));
+
+  const list=await request(mf,'/api/guilds',token);
+  assert.equal(list.status,200,JSON.stringify(list.body));
+  assert.equal(list.body.length,1);
+  assert.equal(list.body[0].id,guildId);
+  assert.equal(list.body[0].name,guild.name);
+});
+
+test('guild list falls back to cache and cron does not consume the guild-list bucket', async t => {
+  const {mf, calls} = await runtime(t, {guildListFailureAfterFirst:true});
+  const login = await request(mf, '/api/login', null, 'POST', {password:'local-test-password'});
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const first=await request(mf,'/api/guilds',token);
+  assert.equal(first.status,200,JSON.stringify(first.body));
+  assert.equal(first.body.length,1);
+
+  const second=await request(mf,'/api/guilds',token);
+  assert.equal(second.status,200,JSON.stringify(second.body));
+  assert.equal(second.body[0].id,guildId);
+
+  const beforeCron=calls.filter(call=>call.path==='/api/v10/users/@me/guilds').length;
+  const worker=await mf.getWorker();
+  const scheduled=await worker.scheduled({cron:'* * * * *'});
+  assert.equal(scheduled.outcome,'ok');
+  const afterCron=calls.filter(call=>call.path==='/api/v10/users/@me/guilds').length;
+  assert.equal(afterCron,beforeCron,'cron must not call the Discord guild-list endpoint');
+});
+
+for (const legacy of [false, true]) {
+  test(`dashboard bootstrap and persisted data on ${legacy ? 'legacy' : 'empty'} D1`, async t => {
+    const {mf, db, calls} = await runtime(t);
+    if (legacy) {
+      await db.batch([
+        db.prepare('CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)'),
+        db.prepare("INSERT INTO meta VALUES ('schema_version','1')"),
+        db.prepare("CREATE TABLE guild_settings (guild_id TEXT PRIMARY KEY,config TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL)"),
+        db.prepare('INSERT INTO guild_settings VALUES (?,?,?)').bind(guildId, JSON.stringify({spamMax:17}), 1)
+      ]);
+    }
+    const rejected = await request(mf, '/api/login', null, 'POST', {password:'wrong'});
+    assert.equal(rejected.status, 401);
+    const login = await request(mf, '/api/login', null, 'POST', {password:'local-test-password'});
+    assert.equal(login.status, 200);
+    const token = login.body.token;
+    assert.ok(token);
+    for (const path of ['/api/me','/api/guilds',`/api/guilds/${guildId}/meta`]) {
+      const result = await request(mf,path,token);
+      assert.equal(result.status,200,JSON.stringify(result.body));
+      if (path.endsWith('/meta')) { assert.equal(result.body.channels.length,1); assert.equal(result.body.categories.length,1); }
+    }
+    const guildLookups=calls.filter(c=>c.path===`/api/v10/guilds/${guildId}`).length;
+    assert.ok(
+      guildLookups>=2&&guildLookups<=3,
+      'guild lookup must retry 429; a direct membership confirmation may add one probe'
+    );
+    const results = await Promise.all(['settings','products','vending'].map(s=>request(mf,`/api/guilds/${guildId}/${s}`,token)));
+    for (const result of results) assert.equal(result.status,200,JSON.stringify(result.body));
+    assert.equal(results[0].body.spamMax,legacy?17:6);
+    assert.deepEqual(results[1].body,[]);
+    assert.deepEqual(results[2].body,[]);
+    const version = await db.prepare("SELECT value FROM meta WHERE key='schema_version'").first();
+    assert.equal(version.value,'5');
+    const vm = await request(mf,`/api/guilds/${guildId}/vending`,token,'POST',{name:'Local test machine'});
+    assert.equal(vm.status,201,JSON.stringify(vm.body));
+    const vmList = await request(mf,`/api/guilds/${guildId}/vending`,token);
+    assert.equal(vmList.body.length,1);
+
+    const imageUpload=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/panel-image`,
+      token,
+      'POST',
+      {dataUrl:'data:image/png;base64,aGVsbG8='}
+    );
+    assert.equal(imageUpload.status,200,JSON.stringify(imageUpload.body));
+    assert.match(imageUpload.body.url,/\/media\/vending\//);
+    const mediaResponse=await mf.dispatchFetch(imageUpload.body.url);
+    assert.equal(mediaResponse.status,200);
+    assert.equal(mediaResponse.headers.get('content-type'),'image/png');
+    assert.equal(await mediaResponse.text(),'hello');
+    const imageDetail=await request(mf,`/api/guilds/${guildId}/vending/${vm.body.id}`,token);
+    assert.equal(imageDetail.body.panel_image_url,imageUpload.body.url);
+    const imageDelete=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/panel-image`,
+      token,
+      'DELETE'
+    );
+    assert.equal(imageDelete.status,200);
+    assert.equal((await mf.dispatchFetch(imageUpload.body.url)).status,404);
+
+    const missingInfiniteContent=await request(
+      mf,`/api/guilds/${guildId}/vending/${vm.body.id}/products`,token,'POST',
+      {name:'Broken infinite',pricePayPay:100,priceKyash:100,infiniteStock:true}
+    );
+    assert.equal(missingInfiniteContent.status,400);
+
+    const infiniteProduct=await request(
+      mf,`/api/guilds/${guildId}/vending/${vm.body.id}/products`,token,'POST',
+      {
+        name:'Infinite product',
+        pricePayPay:100,
+        priceKyash:100,
+        infiniteStock:true,
+        infiniteContent:'same delivery every time'
+      }
+    );
+    assert.equal(infiniteProduct.status,201,JSON.stringify(infiniteProduct.body));
+    assert.equal(infiniteProduct.body.infinite_stock,1);
+    assert.equal(infiniteProduct.body.infinite_content,'same delivery every time');
+
+    const invalidFiniteStock=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/products/${infiniteProduct.body.id}/stock`,
+      token,
+      'POST',
+      {lines:['should not be stored']}
+    );
+    assert.equal(invalidFiniteStock.status,409);
+
+    const secondVm=await request(
+      mf,`/api/guilds/${guildId}/vending`,token,'POST',{name:'Second machine'}
+    );
+    assert.equal(secondVm.status,201);
+    const crossMachineUpdate=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${secondVm.body.id}/products/${infiniteProduct.body.id}`,
+      token,
+      'PATCH',
+      {name:'must not move'}
+    );
+    assert.equal(crossMachineUpdate.status,404);
+
+    const finiteProduct=await request(
+      mf,`/api/guilds/${guildId}/vending/${vm.body.id}/products`,token,'POST',
+      {name:'Finite product',pricePayPay:200,priceKyash:200}
+    );
+    assert.equal(finiteProduct.status,201,JSON.stringify(finiteProduct.body));
+    assert.equal(finiteProduct.body.infinite_stock,0);
+
+    const defaultStockNotification=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/stock-notification`,
+      token
+    );
+    assert.equal(defaultStockNotification.status,200);
+    assert.equal(defaultStockNotification.body,null,'stock notifications default to off');
+
+    const disabledStockNotification=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/stock-notification`,
+      token,
+      'POST',
+      {enabled:false,channelId:chatChannelId,roleId:targetRoleId}
+    );
+    assert.equal(disabledStockNotification.status,200,JSON.stringify(disabledStockNotification.body));
+    assert.equal(disabledStockNotification.body.enabled,false);
+    const disabledState=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/stock-notification`,
+      token
+    );
+    assert.equal(disabledState.body.enabled,0);
+
+    const messagesBeforeDisabledStock=calls.filter(call=>
+      call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`
+    ).length;
+    const disabledStockAdd=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/products/${finiteProduct.body.id}/stock`,
+      token,
+      'POST',
+      {lines:['stock-disabled-notify']}
+    );
+    assert.equal(disabledStockAdd.status,200,JSON.stringify(disabledStockAdd.body));
+    assert.equal(
+      calls.filter(call=>call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`).length,
+      messagesBeforeDisabledStock,
+      'disabled stock notifications must not post to Discord'
+    );
+
+    const enabledStockNotification=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/stock-notification`,
+      token,
+      'POST',
+      {enabled:true,channelId:chatChannelId,roleId:targetRoleId}
+    );
+    assert.equal(enabledStockNotification.status,200,JSON.stringify(enabledStockNotification.body));
+    assert.equal(enabledStockNotification.body.enabled,true);
+    const enabledState=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/stock-notification`,
+      token
+    );
+    assert.equal(enabledState.body.enabled,1);
+
+    const messagesBeforeEnabledStock=calls.filter(call=>
+      call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`
+    ).length;
+    const enabledStockAdd=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/products/${finiteProduct.body.id}/stock`,
+      token,
+      'POST',
+      {lines:['stock-enabled-notify']}
+    );
+    assert.equal(enabledStockAdd.status,200,JSON.stringify(enabledStockAdd.body));
+    const stockAlertCalls=calls.filter(call=>
+      call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`
+    );
+    assert.equal(stockAlertCalls.length,messagesBeforeEnabledStock+1);
+    assert.equal(stockAlertCalls.at(-1)?.body?.embeds?.[0]?.title,'在庫追加のお知らせ');
+    const finiteStock=await request(
+      mf,
+      `/api/guilds/${guildId}/vending/${vm.body.id}/products/${finiteProduct.body.id}/stock`,
+      token,
+      'POST',
+      {lines:['stock-a','stock-b'],notify:false}
+    );
+    assert.equal(finiteStock.status,200,JSON.stringify(finiteStock.body));
+    assert.equal(finiteStock.body.added,2);
+    const vmDetail=await request(mf,`/api/guilds/${guildId}/vending/${vm.body.id}`,token);
+    const finiteDetail=vmDetail.body.products.find(item=>item.id===finiteProduct.body.id);
+    assert.equal(finiteDetail.stock_count,4);
+
+    const product = await request(mf,`/api/guilds/${guildId}/products`,token,'POST',{
+      name:'Local text product',priceYen:100,deliveryType:'text',deliveryText:'test only'
+    });
+    assert.equal(product.status,201,JSON.stringify(product.body));
+    assert.equal((await request(mf,`/api/guilds/${guildId}/products`,token)).body.length,1);
+    assert.equal((await request(mf,'/api/logout',token,'POST')).status,200);
+    assert.equal((await request(mf,'/api/me',token)).status,401);
+  });
+}
+
+test('legacy stock notification settings migrate as enabled', async t => {
+  const {mf,db}=await runtime(t);
+  await db.prepare(
+    'CREATE TABLE vending_stock_notifications (vending_machine_id TEXT PRIMARY KEY,guild_id TEXT NOT NULL,channel_id TEXT NOT NULL,role_id TEXT NOT NULL,updated_at INTEGER NOT NULL)'
+  ).run();
+  await db.prepare(
+    'INSERT INTO vending_stock_notifications(vending_machine_id,guild_id,channel_id,role_id,updated_at) VALUES (?,?,?,?,?)'
+  ).bind('legacy-machine',guildId,chatChannelId,targetRoleId,1).run();
+
+  const login=await request(mf,'/api/login',null,'POST',{password:'local-test-password'});
+  assert.equal(login.status,200);
+  const list=await request(mf,`/api/guilds/${guildId}/vending`,login.body.token);
+  assert.equal(list.status,200,JSON.stringify(list.body));
+
+  const migrated=await db.prepare(
+    'SELECT enabled FROM vending_stock_notifications WHERE vending_machine_id=?'
+  ).bind('legacy-machine').first();
+  assert.equal(migrated?.enabled,1,'previously configured stock alerts should remain enabled after migration');
+});
+
+test('achievement count display adopts an existing channel suffix count', async t => {
+  const {mf,calls}=await runtime(t,{chatChannelName:'自販機実績4552件'});
+  const login=await request(mf,'/api/login',null,'POST',{password:'local-test-password'});
+  assert.equal(login.status,200);
+  const token=login.body.token;
+  const machine=await request(
+    mf,`/api/guilds/${guildId}/vending`,token,'POST',{name:'Existing count machine'}
+  );
+  assert.equal(machine.status,201,JSON.stringify(machine.body));
+
+  const saved=await request(
+    mf,`/api/guilds/${guildId}/vending/achievement-room`,token,'PUT',
+    {rooms:[{
+      channelId:chatChannelId,
+      machineIds:[machine.body.id],
+      countDisplayEnabled:true
+    }]}
+  );
+  assert.equal(saved.status,200,JSON.stringify(saved.body));
+  assert.equal(saved.body.rooms[0].achievement_count,4552);
+  assert.equal(saved.body.rooms[0].base_channel_name,'自販機実績');
+  const rename=calls.filter(call=>
+    call.method==='PATCH'&&call.path===`/api/v10/channels/${chatChannelId}`
+  ).at(-1);
+  assert.equal(rename?.body?.name,'自販機実績4552件');
+});
+
+test('achievement channel count display defaults off and restores channel name', async t => {
+  const {mf,calls,db}=await runtime(t);
+  const login=await request(mf,'/api/login',null,'POST',{password:'local-test-password'});
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const machine=await request(
+    mf,`/api/guilds/${guildId}/vending`,token,'POST',{name:'Count machine'}
+  );
+  assert.equal(machine.status,201,JSON.stringify(machine.body));
+
+  const savedOff=await request(
+    mf,`/api/guilds/${guildId}/vending/achievement-room`,token,'PUT',
+    {rooms:[{channelId:chatChannelId,machineIds:[machine.body.id]}]}
+  );
+  assert.equal(savedOff.status,200,JSON.stringify(savedOff.body));
+  assert.equal(savedOff.body.rooms.length,1);
+  assert.equal(savedOff.body.rooms[0].count_display_enabled,0);
+  assert.equal(savedOff.body.rooms[0].achievement_count,0);
+  assert.equal(
+    calls.filter(call=>
+      call.method==='PATCH'&&
+      call.path===`/api/v10/channels/${chatChannelId}`&&
+      typeof call.body?.name==='string'
+    ).length,
+    0,
+    'count display must be off by default'
+  );
+
+  const routeId=savedOff.body.rooms[0].id;
+  const savedOn=await request(
+    mf,`/api/guilds/${guildId}/vending/achievement-room`,token,'PUT',
+    {rooms:[{
+      id:routeId,
+      channelId:chatChannelId,
+      machineIds:[machine.body.id],
+      countDisplayEnabled:true
+    }]}
+  );
+  assert.equal(savedOn.status,200,JSON.stringify(savedOn.body));
+  assert.equal(savedOn.body.rooms[0].count_display_enabled,1);
+  const initialRename=calls.filter(call=>
+    call.method==='PATCH'&&call.path===`/api/v10/channels/${chatChannelId}`
+  ).at(-1);
+  assert.equal(initialRename?.body?.name,'chat0件');
+
+  await db.prepare(
+    'UPDATE vending_achievement_routes SET achievement_count=12,count_name_synced_at=0 WHERE id=?'
+  ).bind(routeId).run();
+
+  const resynced=await request(
+    mf,`/api/guilds/${guildId}/vending/achievement-room`,token,'PUT',
+    {rooms:[{
+      id:routeId,
+      channelId:chatChannelId,
+      machineIds:[machine.body.id],
+      countDisplayEnabled:true
+    }]}
+  );
+  assert.equal(resynced.status,200,JSON.stringify(resynced.body));
+  assert.equal(resynced.body.rooms[0].achievement_count,12);
+  const countRename=calls.filter(call=>
+    call.method==='PATCH'&&call.path===`/api/v10/channels/${chatChannelId}`
+  ).at(-1);
+  assert.equal(countRename?.body?.name,'chat12件');
+
+  const savedDisabled=await request(
+    mf,`/api/guilds/${guildId}/vending/achievement-room`,token,'PUT',
+    {rooms:[{
+      id:routeId,
+      channelId:chatChannelId,
+      machineIds:[machine.body.id],
+      countDisplayEnabled:false
+    }]}
+  );
+  assert.equal(savedDisabled.status,200,JSON.stringify(savedDisabled.body));
+  assert.equal(savedDisabled.body.rooms[0].count_display_enabled,0);
+  const restore=calls.filter(call=>
+    call.method==='PATCH'&&call.path===`/api/v10/channels/${chatChannelId}`
+  ).at(-1);
+  assert.equal(restore?.body?.name,'chat');
+});
+
+test('dashboard metadata load is read-only and does not patch tracked panels', async t => {
+  const {mf,calls,db} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const recovery=await request(
+    mf,
+    `/api/guilds/${guildId}/recovery/status`,
+    token
+  );
+  assert.equal(recovery.status,200,JSON.stringify(recovery.body));
+
+  await db.prepare(`
+    INSERT INTO panel_deployments(
+      guild_id,kind,object_id,channel_id,message_id,created_at,updated_at
+    ) VALUES (?,?,?,?,?,?,?)
+  `).bind(
+    guildId,'verification','',chatChannelId,'723456789012345678',Date.now(),Date.now()
+  ).run();
+
+  const meta=await request(mf,`/api/guilds/${guildId}/meta`,token);
+  assert.equal(meta.status,200,JSON.stringify(meta.body));
+  assert.equal(meta.body.verificationPanelUpgrade,undefined);
+
+  const patch=calls.find(call=>
+    call.method==='PATCH'&&
+    call.path===`/api/v10/channels/${chatChannelId}/messages/723456789012345678`
+  );
+  assert.equal(patch,undefined,'loading dashboard metadata must not mutate Discord');
+});
+
+test('verification panel deployment points directly to unified oauth', async t => {
+  const {mf,calls,db} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const rejected=await request(
+    mf,
+    `/api/guilds/${guildId}/verification/panel`,
+    token,
+    'POST',
+    {channelId:chatChannelId}
+  );
+  assert.equal(rejected.status,409,JSON.stringify(rejected.body));
+  assert.match(rejected.body.message,/認証後ロール/);
+  assert.equal(
+    calls.some(call=>call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`),
+    false,
+    'an unusable verification panel must not be posted'
+  );
+
+  const settings=await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  const deployed=await request(
+    mf,
+    `/api/guilds/${guildId}/verification/panel`,
+    token,
+    'POST',
+    {channelId:chatChannelId}
+  );
+  assert.equal(deployed.status,200,JSON.stringify(deployed.body));
+
+  const post=calls.find(call=>
+    call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`
+  );
+  assert.ok(post?.body,'verification panel payload must be sent to Discord');
+  const button=post.body.components?.[0]?.components?.[0];
+  assert.equal(button?.style,5);
+  assert.equal(button?.custom_id,undefined);
+  const panelUrl=new URL(button?.url);
+  assert.equal(panelUrl.origin,'https://worker.example');
+  assert.equal(panelUrl.pathname,'/auth/verification/start');
+  assert.equal(panelUrl.searchParams.get('guild_id'),guildId);
+  assert.match(post.body.embeds?.[0]?.description??'',/復旧/);
+
+  const deployment=await db.prepare(
+    "SELECT channel_id,message_id FROM panel_deployments WHERE guild_id=? AND kind='verification'"
+  ).bind(guildId).first();
+  assert.equal(deployment?.channel_id,chatChannelId);
+  assert.ok(deployment?.message_id);
+});
+
+test('verification panel deployment accepts and persists current role selection', async t => {
+  const {mf,calls} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+
+  const deployed=await request(
+    mf,
+    `/api/guilds/${guildId}/verification/panel`,
+    login.body.token,
+    'POST',
+    {channelId:chatChannelId,verifiedRoleId:targetRoleId}
+  );
+  assert.equal(deployed.status,200,JSON.stringify(deployed.body));
+
+  const settings=await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    login.body.token
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+  assert.equal(settings.body.verifiedRoleId,targetRoleId);
+
+  const post=calls.find(call=>
+    call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`
+  );
+  assert.ok(post?.body,'current dashboard role selection must allow panel deployment');
+});
+
+test('verification panel oauth stores recovery access before assigning the role', async t => {
+  const {mf,calls,db,interactionPrivateKey,verificationMemberRoles} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  const settings = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    login.body.token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  // This is the actual URL used by newly deployed verification panels.
+  const started=await mf.dispatchFetch(
+    'https://worker.example/auth/verification/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  assert.equal(started.status,302);
+  const authorizeUrl=new URL(started.headers.get('location'));
+  assert.equal(authorizeUrl.hostname,'discord.com');
+  assert.ok(authorizeUrl.searchParams.get('scope')?.includes('guilds.join'));
+  const state=authorizeUrl.searchParams.get('state');
+  assert.ok(state);
+  assert.equal(verificationMemberRoles.includes(targetRoleId),false);
+
+  const stateRow=await db.prepare(
+    'SELECT purpose,expected_user_id FROM member_recovery_oauth_states WHERE state=?'
+  ).bind(state).first();
+  assert.equal(stateRow?.purpose,'verification');
+  assert.equal(stateRow?.expected_user_id,null);
+
+  const callback=await mf.dispatchFetch(
+    'https://worker.example/auth/discord/callback?code=ok&state='+encodeURIComponent(state)
+  );
+  assert.equal(callback.status,200);
+  assert.equal(callback.headers.get('cache-control'),'no-store');
+  assert.match(callback.headers.get('content-security-policy')??'',/default-src 'none'/);
+
+  const saved = await db.prepare(
+    'SELECT user_id,revoked_at FROM member_recovery_tokens WHERE guild_id=? AND user_id=?'
+  ).bind(guildId,verificationUserId).first();
+  assert.equal(saved?.user_id,verificationUserId);
+  assert.equal(saved?.revoked_at,null);
+  assert.ok(verificationMemberRoles.includes(targetRoleId));
+
+  const grantPath=
+    `/api/v10/guilds/${guildId}/members/${verificationUserId}/roles/${targetRoleId}`;
+  assert.ok(calls.some(call=>call.method==='PUT'&&call.path===grantPath));
+
+  // Restored/legacy verification panels still use an interaction button.
+  // It must create the same verification-purpose OAuth state and bind it to
+  // the Discord user who pressed the button.
+  const interactionStart = await signedInteraction(mf,interactionPrivateKey,{
+    id:'923456789012345678',
+    application_id:botId,
+    token:'verification-interaction-token',
+    type:3,
+    guild_id:guildId,
+    member:{user:{id:verificationUserId,username:'Verifier'}},
+    data:{custom_id:`verify:start:${guildId}`}
+  });
+  assert.equal(interactionStart.status,200,JSON.stringify(interactionStart.body));
+  assert.equal(interactionStart.body.type,5,'slow verification interaction must be deferred');
+  assert.equal(interactionStart.body.data.flags,64,'deferred response must remain ephemeral');
+
+  const interactionStateRow=await eventually(()=>db.prepare(
+    'SELECT state,purpose,expected_user_id FROM member_recovery_oauth_states WHERE expected_user_id=? ORDER BY expires_at DESC LIMIT 1'
+  ).bind(verificationUserId).first());
+  assert.ok(interactionStateRow?.state);
+  assert.equal(interactionStateRow?.purpose,'verification');
+  assert.equal(interactionStateRow?.expected_user_id,verificationUserId);
+
+  const deferredUpdate=await eventually(()=>calls.find(call=>
+    call.method==='PATCH'&&
+    call.path===`/api/v10/webhooks/${botId}/verification-interaction-token/messages/@original`
+  ));
+  assert.ok(deferredUpdate);
+  assert.match(
+    deferredUpdate.body?.data?.components?.[0]?.components?.[0]?.url??
+    deferredUpdate.body?.components?.[0]?.components?.[0]?.url??'',
+    /\/auth\/discord\/authorize|discord\.com\/oauth2\/authorize/
+  );
+
+  const remaining = await db.prepare(
+    'SELECT COUNT(*) AS count FROM verification_challenges'
+  ).first();
+  assert.equal(remaining.count,0);
+
+  const legacyStart=await mf.dispatchFetch(
+    'https://worker.example/auth/recovery/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  assert.equal(legacyStart.status,302);
+  const legacyAuthorizeUrl=new URL(legacyStart.headers.get('location'));
+  const legacyState=legacyAuthorizeUrl.searchParams.get('state');
+  assert.ok(legacyState);
+  const legacyStateRow=await db.prepare(
+    'SELECT purpose FROM member_recovery_oauth_states WHERE state=?'
+  ).bind(legacyState).first();
+  assert.equal(
+    legacyStateRow?.purpose,
+    'verification',
+    'legacy recovery links must use the unified verification flow'
+  );
+});
+
+test('verification uses a canonical callback on preview domains and panel links', async t => {
+  const redirect='https://canonical-worker.example/auth/discord/callback';
+  const {mf,calls} = await runtime(t,{discordOAuthRedirectUri:redirect});
+  const login=await request(mf,'/api/login',null,'POST',{password:'local-test-password'});
+  assert.equal(login.status,200);
+  const saved=await request(mf,`/api/guilds/${guildId}/settings`,login.body.token,'PUT',{
+    verifiedRoleId:targetRoleId,minAccountAgeDays:0
+  });
+  assert.equal(saved.status,200,JSON.stringify(saved.body));
+  const panel=await request(mf,`/api/guilds/${guildId}/verification/panel`,login.body.token,'POST',{
+    channelId:chatChannelId
+  });
+  assert.equal(panel.status,200,JSON.stringify(panel.body));
+  const panelPost=calls.find(call=>call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`);
+  assert.equal(
+    new URL(panelPost.body.components[0].components[0].url).origin,
+    'https://canonical-worker.example'
+  );
+
+  const started=await mf.dispatchFetch(
+    `https://preview-worker.example/auth/verification/start?guild_id=${guildId}`,
+    {redirect:'manual'}
+  );
+  assert.equal(started.status,302);
+  const authUrl=new URL(started.headers.get('location'));
+  assert.equal(authUrl.searchParams.get('redirect_uri'),redirect);
+  const state=authUrl.searchParams.get('state');
+  const callback=await mf.dispatchFetch(
+    `https://preview-worker.example/auth/discord/callback?code=ok&state=${encodeURIComponent(state)}`
+  );
+  assert.equal(callback.status,200,await callback.clone().text());
+  const exchange=calls.find(call=>call.method==='POST'&&call.path==='/api/v10/oauth2/token');
+  assert.equal(exchange.body.redirect_uri,redirect);
+});
+
+test('cancelled discord verification consumes state without registering', async t => {
+  const {mf,db,verificationMemberRoles} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  const settings = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    login.body.token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  const started=await mf.dispatchFetch(
+    'https://worker.example/auth/verification/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  const state=new URL(started.headers.get('location')).searchParams.get('state');
+  assert.ok(state);
+
+  const cancelled=await mf.dispatchFetch(
+    'https://worker.example/auth/discord/callback?error=access_denied&state='+encodeURIComponent(state)
+  );
+  assert.equal(cancelled.status,400);
+  assert.match(await cancelled.text(),/認証をキャンセルしました/);
+
+  const remaining=await db.prepare(
+    'SELECT COUNT(*) AS count FROM member_recovery_oauth_states WHERE state=?'
+  ).bind(state).first();
+  assert.equal(remaining.count,0);
+  const saved=await db.prepare(
+    'SELECT COUNT(*) AS count FROM member_recovery_tokens WHERE guild_id=? AND user_id=?'
+  ).bind(guildId,verificationUserId).first();
+  assert.equal(saved.count,0);
+  assert.equal(verificationMemberRoles.includes(targetRoleId),false);
+});
+
+test('verification rejection does not create recovery registration', async t => {
+  const {mf,db,verificationMemberRoles} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  const settings = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    login.body.token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:36500}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  const started=await mf.dispatchFetch(
+    'https://worker.example/auth/verification/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  assert.equal(started.status,302);
+  const state=new URL(started.headers.get('location')).searchParams.get('state');
+  assert.ok(state);
+
+  const callback=await mf.dispatchFetch(
+    'https://worker.example/auth/discord/callback?code=too-young&state='+encodeURIComponent(state)
+  );
+  assert.equal(callback.status,403);
+  const body=await callback.json();
+  assert.match(body.message,/認証条件/);
+
+  const saved=await db.prepare(
+    'SELECT COUNT(*) AS count FROM member_recovery_tokens WHERE guild_id=? AND user_id=?'
+  ).bind(guildId,verificationUserId).first();
+  assert.equal(saved.count,0);
+  assert.equal(verificationMemberRoles.includes(targetRoleId),false);
+});
+
+test('verification role grant failure is not reported as success', async t => {
+  const {mf,db,verificationMemberRoles} = await runtime(t,{
+    forceVerificationRole403:true
+  });
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  const settings = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    login.body.token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  const started=await mf.dispatchFetch(
+    'https://worker.example/auth/verification/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  const state=new URL(started.headers.get('location')).searchParams.get('state');
+  assert.ok(state);
+  const callback=await mf.dispatchFetch(
+    'https://worker.example/auth/discord/callback?code=role-fail&state='+encodeURIComponent(state)
+  );
+  assert.equal(callback.status,403);
+  const body=await callback.json();
+  assert.match(body.message,/認証ロールを付与できませんでした/);
+  assert.equal(verificationMemberRoles.includes(targetRoleId),false);
+
+  const saved=await db.prepare(
+    'SELECT user_id,revoked_at FROM member_recovery_tokens WHERE guild_id=? AND user_id=?'
+  ).bind(guildId,verificationUserId).first();
+  assert.equal(saved?.user_id,verificationUserId);
+  assert.equal(saved?.revoked_at,null);
+});
+
+test('backup snapshot is encrypted, listed, previewable, and recovery uses verification', async t => {
+  const {mf,db,calls} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token = login.body.token;
+
+  const created = await request(
+    mf,
+    `/api/guilds/${guildId}/backups`,
+    token,
+    'POST',
+    {label:'Before major change'}
+  );
+  assert.equal(created.status,201,JSON.stringify(created.body));
+  assert.equal(created.body.sourceGuildId,guildId);
+  assert.equal(created.body.roleCount,3);
+  assert.equal(created.body.channelCount,2);
+  assert.equal(created.body.memberCount,1);
+
+  const stored = await db.prepare(
+    'SELECT payload_enc FROM guild_backups WHERE id=?'
+  ).bind(created.body.id).first();
+  assert.equal(stored?.payload_enc,'chunked:v1');
+  const firstChunk = await db.prepare(
+    'SELECT payload_chunk FROM guild_backup_chunks WHERE backup_id=? ORDER BY chunk_index LIMIT 1'
+  ).bind(created.body.id).first();
+  assert.ok(firstChunk?.payload_chunk);
+  assert.equal(
+    firstChunk.payload_chunk.includes('Regression server'),
+    false,
+    'snapshot chunks must remain encrypted at rest'
+  );
+
+  const listed = await request(
+    mf,
+    `/api/backups?sourceGuildId=${guildId}`,
+    token
+  );
+  assert.equal(listed.status,200,JSON.stringify(listed.body));
+  assert.equal(listed.body.length,1);
+  assert.equal(listed.body[0].id,created.body.id);
+
+  const preview = await request(
+    mf,
+    `/api/backups/${created.body.id}/restore/preview`,
+    token,
+    'POST',
+    {targetGuildId:guildId}
+  );
+  assert.equal(preview.status,200,JSON.stringify(preview.body));
+  assert.equal(preview.body.behavior.destructive,false);
+  assert.equal(preview.body.behavior.deletesExisting,false);
+  assert.equal(preview.body.counts.members,1);
+  assert.equal(preview.body.counts.bans,1);
+
+  const recovery = await request(
+    mf,
+    `/api/guilds/${guildId}/recovery/status`,
+    token
+  );
+  assert.equal(recovery.status,200,JSON.stringify(recovery.body));
+  assert.equal(recovery.body.registered,0);
+  assert.equal(recovery.body.registrationMode,'verification');
+  assert.equal(recovery.body.separatePanelAvailable,false);
+  assert.equal(
+    recovery.body.authorizePath,
+    '/auth/verification/start?guild_id='+encodeURIComponent(guildId)
+  );
+
+  const panel = await request(
+    mf,
+    `/api/guilds/${guildId}/recovery/panel`,
+    token,
+    'POST',
+    {channelId:chatChannelId}
+  );
+  assert.equal(panel.status,410,JSON.stringify(panel.body));
+  assert.match(panel.body.message,/認証パネルへ統合/);
+  const deployment = await db.prepare(
+    "SELECT COUNT(*) AS count FROM panel_deployments WHERE guild_id=? AND kind='recovery'"
+  ).bind(guildId).first();
+  assert.equal(deployment.count,0);
+});
+
+test('restore job replays guild extras and bans without deleting existing structure', async t => {
+  const {mf,calls} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const settings=await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+  const verificationPanel=await request(
+    mf,
+    `/api/guilds/${guildId}/verification/panel`,
+    token,
+    'POST',
+    {channelId:chatChannelId}
+  );
+  assert.equal(verificationPanel.status,200,JSON.stringify(verificationPanel.body));
+
+  const created=await request(
+    mf,
+    `/api/guilds/${guildId}/backups`,
+    token,
+    'POST',
+    {label:'Restore regression'}
+  );
+  assert.equal(created.status,201,JSON.stringify(created.body));
+
+  const started=await request(
+    mf,
+    `/api/backups/${created.body.id}/restore`,
+    token,
+    'POST',
+    {targetGuildId:guildId}
+  );
+  assert.equal(started.status,202,JSON.stringify(started.body));
+  assert.equal(started.body.result.workerOrigin,undefined);
+  const storedJob=await (await mf.getD1Database('DB')).prepare(
+    'SELECT result_json FROM guild_restore_jobs WHERE id=?'
+  ).bind(started.body.id).first();
+  assert.equal(JSON.parse(storedJob.result_json).workerOrigin,'https://worker.example');
+
+  const worker=await mf.getWorker();
+  let job=started.body;
+  for(let tick=0;tick<24 && !['completed','failed','cancelled'].includes(job.status);tick++){
+    const scheduled=await worker.scheduled({cron:'* * * * *'});
+    assert.equal(scheduled.outcome,'ok');
+    const current=await request(mf,`/api/restore-jobs/${job.id}`,token);
+    assert.equal(current.status,200,JSON.stringify(current.body));
+    job=current.body;
+  }
+
+  assert.equal(job.status,'completed',JSON.stringify(job));
+  assert.equal(job.result.bansRestored,1);
+  assert.ok(job.result.guildExtrasRestored>=2);
+  assert.ok(
+    calls.some(call=>
+      call.method==='PUT'&&
+      call.path===`/api/v10/guilds/${guildId}/bans/${bannedUserId}`
+    ),
+    'restore must recreate the backed-up ban'
+  );
+  assert.ok(
+    calls.some(call=>
+      call.method==='PATCH'&&
+      call.path===`/api/v10/guilds/${guildId}/welcome-screen`
+    ),
+    'restore must replay the welcome screen'
+  );
+  assert.ok(
+    calls.some(call=>
+      call.method==='PATCH'&&
+      call.path===`/api/v10/guilds/${guildId}/widget`
+    ),
+    'restore must replay widget settings'
+  );
+
+  const panelWrites=calls.filter(call=>
+    (call.method==='POST'&&call.path===`/api/v10/channels/${chatChannelId}/messages`)||
+    (call.method==='PATCH'&&call.path===`/api/v10/channels/${chatChannelId}/messages/723456789012345678`)
+  );
+  assert.ok(panelWrites.length>=2,'verification panel must be refreshed during restore');
+  assert.ok(
+    panelWrites.some(call=>call.method==='PATCH'),
+    'an existing legacy verification panel must be upgraded in place'
+  );
+  const restoredPanel=panelWrites.at(-1)?.body;
+  const restoredButton=restoredPanel?.components?.[0]?.components?.[0];
+  assert.equal(restoredButton?.style,5);
+  assert.equal(restoredButton?.custom_id,undefined);
+  const restoredUrl=new URL(restoredButton?.url);
+  assert.equal(restoredUrl.origin,'https://worker.example');
+  assert.equal(restoredUrl.pathname,'/auth/verification/start');
+  assert.equal(restoredUrl.searchParams.get('guild_id'),guildId);
+
+  assert.equal(
+    calls.some(call=>call.method==='DELETE'&&/\/channels\/\d+$/.test(call.path)),
+    false,
+    'safe restore must never delete existing channels'
+  );
+});
+
+test('member restore refreshes a rejected OAuth token and retries the same user', async t => {
+  const {mf,calls,db} = await runtime(t, {
+    oauthExpiresIn:7200,
+    verificationMemberMissingAfter:2,
+    memberAddInvalidTokenOnce:true
+  });
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token=login.body.token;
+
+  const settings=await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {verifiedRoleId:targetRoleId,minAccountAgeDays:0}
+  );
+  assert.equal(settings.status,200,JSON.stringify(settings.body));
+
+  const startedOauth=await mf.dispatchFetch(
+    'https://worker.example/auth/verification/start?guild_id='+encodeURIComponent(guildId),
+    {redirect:'manual'}
+  );
+  assert.equal(startedOauth.status,302);
+  const state=new URL(startedOauth.headers.get('location')).searchParams.get('state');
+  assert.ok(state);
+  const callback=await mf.dispatchFetch(
+    'https://worker.example/auth/discord/callback?code=ok&state='+encodeURIComponent(state)
+  );
+  assert.equal(callback.status,200);
+
+  const created=await request(
+    mf,
+    `/api/guilds/${guildId}/backups`,
+    token,
+    'POST',
+    {label:'OAuth retry regression'}
+  );
+  assert.equal(created.status,201,JSON.stringify(created.body));
+
+  const restore=await request(
+    mf,
+    `/api/backups/${created.body.id}/restore`,
+    token,
+    'POST',
+    {targetGuildId:guildId}
+  );
+  assert.equal(restore.status,202,JSON.stringify(restore.body));
+
+  const worker=await mf.getWorker();
+  let job=restore.body;
+  for(let tick=0;tick<30 && !['completed','failed','cancelled'].includes(job.status);tick++){
+    const scheduled=await worker.scheduled({cron:'* * * * *'});
+    assert.equal(scheduled.outcome,'ok');
+    const current=await request(mf,`/api/restore-jobs/${job.id}`,token);
+    assert.equal(current.status,200,JSON.stringify(current.body));
+    job=current.body;
+  }
+
+  assert.equal(job.status,'completed',JSON.stringify(job));
+  assert.equal(job.result.membersAdded,1);
+
+  const addPath=`/api/v10/guilds/${guildId}/members/${verificationUserId}`;
+  const memberAdds=calls.filter(call=>call.method==='PUT'&&call.path===addPath);
+  assert.equal(memberAdds.length,2,'50025 must cause exactly one refresh + retry');
+  assert.equal(memberAdds[0].body?.access_token,'verification-access-token');
+  assert.equal(memberAdds[1].body?.access_token,'refreshed-access-token');
+
+  const tokenCalls=calls.filter(call=>
+    call.method==='POST'&&call.path==='/api/v10/oauth2/token'
+  );
+  assert.ok(tokenCalls.some(call=>call.body?.grant_type==='refresh_token'));
+
+  const recovery=await db.prepare(
+    'SELECT revoked_at FROM member_recovery_tokens WHERE guild_id=? AND user_id=?'
+  ).bind(guildId,verificationUserId).first();
+  assert.equal(recovery?.revoked_at,null);
+});
+
+test('verification settings persist account age and role values', async t => {
+  const {mf} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token = login.body.token;
+
+  const saved = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {
+      verifiedRoleId:targetRoleId,
+      minAccountAgeDays:37
+    }
+  );
+  assert.equal(saved.status,200,JSON.stringify(saved.body));
+  assert.equal(saved.body.verifiedRoleId,targetRoleId);
+  assert.equal(saved.body.minAccountAgeDays,37);
+
+  const fresh = await request(mf,`/api/guilds/${guildId}/settings`,token);
+  assert.equal(fresh.status,200,JSON.stringify(fresh.body));
+  assert.equal(fresh.body.verifiedRoleId,targetRoleId);
+  assert.equal(fresh.body.minAccountAgeDays,37);
+
+  const invalid = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {minAccountAgeDays:-1}
+  );
+  assert.equal(invalid.status,400,JSON.stringify(invalid.body));
+});
+
+test('verification settings do not false-block equal Discord role positions', async t => {
+  const {mf} = await runtime(t, {
+    botRolePosition:1,
+    targetRolePosition:1
+  });
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token = login.body.token;
+
+  const saved = await request(
+    mf,
+    `/api/guilds/${guildId}/settings`,
+    token,
+    'PUT',
+    {
+      verifiedRoleId:targetRoleId,
+      minAccountAgeDays:7
+    }
+  );
+
+  assert.equal(saved.status,200,JSON.stringify(saved.body));
+  assert.equal(saved.body.verifiedRoleId,targetRoleId);
+  assert.equal(saved.body.minAccountAgeDays,7);
+});
+
+test('D1 rejects multiline exec but migration uses complete prepared statements', async t => {
+  const {db} = await runtime(t);
+  await assert.rejects(db.exec('CREATE TABLE broken (\n id TEXT PRIMARY KEY\n);'), /incomplete input/);
+});
+
+
+test('channel permission edit does not require direct channel access', async t => {
+  const {mf, calls} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const token = login.body.token;
+
+  const result = await request(
+    mf,
+    `/api/guilds/${guildId}/channels/${chatChannelId}/permissions/${targetRoleId}`,
+    token,
+    'PATCH',
+    {
+      targetType:'role',
+      permissions:{send:'deny'}
+    }
+  );
+
+  assert.equal(result.status,200,JSON.stringify(result.body));
+  assert.equal(result.body.targetId,targetRoleId);
+  assert.equal(result.body.deny,'2048');
+  assert.equal(
+    calls.some(
+      call=>
+        call.method==='GET' &&
+        call.path===`/api/v10/channels/${chatChannelId}`
+    ),
+    false,
+    'permission editing must not GET the inaccessible channel directly'
+  );
+  const atomicWrite = calls.find(
+    call=>
+      call.method==='PATCH' &&
+      call.path===`/api/v10/channels/${chatChannelId}`
+  );
+  assert.ok(atomicWrite,'channel overwrites should be written atomically');
+  assert.equal(result.body.verified,true);
+});
+
+
+test('channel permission edit supports the expanded priority permission set', async t => {
+  const {mf} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+
+  const result = await request(
+    mf,
+    `/api/guilds/${guildId}/channels/${chatChannelId}/permissions/${targetRoleId}`,
+    login.body.token,
+    'PATCH',
+    {
+      targetType:'role',
+      permissions:{
+        history:'allow',
+        embeds:'allow',
+        appCommands:'allow',
+        polls:'allow',
+        createPublicThreads:'allow',
+        createPrivateThreads:'deny',
+        sendInThreads:'allow',
+        manageThreads:'deny',
+        stream:'allow'
+      }
+    }
+  );
+
+  assert.equal(result.status,200,JSON.stringify(result.body));
+  assert.equal(result.body.verified,true);
+  const allow=BigInt(result.body.allow);
+  const deny=BigInt(result.body.deny);
+  assert.equal(allow&65536n,65536n,'message history must be allowed');
+  assert.equal(allow&16384n,16384n,'embed links must be allowed');
+  assert.equal(allow&2147483648n,2147483648n,'application commands must be allowed');
+  assert.equal(allow&562949953421312n,562949953421312n,'polls must be allowed');
+  assert.equal(allow&34359738368n,34359738368n,'public threads must be allowed');
+  assert.equal(deny&68719476736n,68719476736n,'private threads must be denied');
+  assert.equal(allow&274877906944n,274877906944n,'thread messages must be allowed');
+  assert.equal(deny&17179869184n,17179869184n,'thread management must be denied');
+  assert.equal(allow&512n,512n,'streaming must be allowed');
+});
+
+
+test('non-admin bot role allow overrides @everyone channel deny', async t => {
+  const botPermissions = nonAdminBotPermissions;
+  const {mf} = await runtime(t, {
+    botPermissions,
+    channelOverwrites:[
+      {id:guildId,type:0,allow:'0',deny:'1024'},
+      {id:botRoleId,type:0,allow:'1024',deny:'0'}
+    ]
+  });
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+  const meta = await request(mf, `/api/guilds/${guildId}/meta`, login.body.token);
+  assert.equal(meta.status,200,JSON.stringify(meta.body));
+  const chat = meta.body.channels.find(channel=>channel.id===chatChannelId);
+  assert.ok(chat);
+  assert.equal(chat.botCanView,true);
+  assert.equal(meta.body.botAdministrator,false);
+  assert.equal(meta.body.botAccessRepair,undefined);
+
+  const repaired=await request(
+    mf,
+    `/api/guilds/${guildId}/bot-access/repair`,
+    login.body.token,
+    'POST'
+  );
+  assert.equal(repaired.status,200,JSON.stringify(repaired.body));
+  assert.ok(repaired.body.repaired>=1);
+  assert.equal(repaired.body.failed.length,0);
+});
+
+test('editing @everyone protects the bot member before applying the deny', async t => {
+  const botPermissions = (
+    1024n|2048n|16384n|32768n|65536n|8192n|16n|268435456n
+  ).toString();
+  const {mf,calls} = await runtime(t,{botPermissions});
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+
+  const result = await request(
+    mf,
+    `/api/guilds/${guildId}/channels/${chatChannelId}/permissions/${guildId}`,
+    login.body.token,
+    'PATCH',
+    {
+      targetType:'role',
+      permissions:{view:'deny'}
+    }
+  );
+  assert.equal(result.status,200,JSON.stringify(result.body));
+
+  const atomicWrite = calls.find(call=>
+    call.method==='PATCH' &&
+    call.path===`/api/v10/channels/${chatChannelId}` &&
+    Array.isArray(call.body?.permission_overwrites)
+  );
+  assert.ok(atomicWrite,'permission update must use one atomic channel patch');
+
+  const everyoneOverwrite = atomicWrite.body.permission_overwrites.find(
+    overwrite=>overwrite.id===guildId&&overwrite.type===0
+  );
+  const botOverwrite = atomicWrite.body.permission_overwrites.find(
+    overwrite=>overwrite.id===botId&&overwrite.type===1
+  );
+  assert.ok(everyoneOverwrite,'@everyone overwrite must be present');
+  assert.ok(botOverwrite,'bot member protection overwrite must be present');
+  assert.equal(
+    (BigInt(everyoneOverwrite.deny)&1024n)===1024n,
+    true,
+    '@everyone View Channel must be denied'
+  );
+  assert.equal(
+    (BigInt(botOverwrite.allow)&1024n)===1024n,
+    true,
+    'bot View Channel must remain allowed in the same atomic write'
+  );
+  assert.equal(result.body.verified,true);
+});
+
+
+test('locked channel repair falls back to full channel overwrite patch', async t => {
+  const {mf,calls} = await runtime(t,{forceBotOverwrite403:true});
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+
+  const meta = await request(mf, `/api/guilds/${guildId}/meta`, login.body.token);
+  assert.equal(meta.status,200,JSON.stringify(meta.body));
+  assert.equal(meta.body.botAccessRepair,undefined);
+  assert.equal(
+    calls.some(call=>
+      call.method==='PATCH' &&
+      call.path===`/api/v10/channels/${chatChannelId}`
+    ),
+    false,
+    'metadata loading must not repair channel permissions'
+  );
+
+  const repaired = await request(
+    mf,
+    `/api/guilds/${guildId}/bot-access/repair`,
+    login.body.token,
+    'POST'
+  );
+  assert.equal(repaired.status,200,JSON.stringify(repaired.body));
+  assert.equal(repaired.body.failed.length,0);
+  assert.ok(
+    calls.some(call=>
+      call.method==='PATCH' &&
+      call.path===`/api/v10/channels/${chatChannelId}`
+    ),
+    'explicit repair should use the full-overwrite PATCH recovery path'
+  );
+});
+
+
+test('bulk channel permission update persists and verifies the selected role overwrite', async t => {
+  const {mf,calls} = await runtime(t);
+  const login = await request(mf, '/api/login', null, 'POST', {
+    password:'local-test-password'
+  });
+  assert.equal(login.status,200);
+
+  const result = await request(
+    mf,
+    `/api/guilds/${guildId}/channels/permissions/bulk`,
+    login.body.token,
+    'PATCH',
+    {
+      channelIds:[chatChannelId],
+      targetId:targetRoleId,
+      permissions:{view:'allow',send:'deny'}
+    }
+  );
+
+  assert.equal(result.status,200,JSON.stringify(result.body));
+  assert.equal(result.body.ok,true,JSON.stringify(result.body));
+  assert.equal(result.body.updated,1,JSON.stringify(result.body));
+  assert.deepEqual(result.body.failed,[]);
+  assert.equal(typeof result.body.operationId,'string');
+  assert.ok(result.body.operationId.length>0);
+  assert.ok(
+    calls.some(call=>
+      call.method==='PUT' &&
+      call.path===`/api/v10/channels/${chatChannelId}/permissions/${targetRoleId}`
+    ),
+    'bulk endpoint must write the selected role overwrite'
+  );
+
+  const meta = await request(mf,`/api/guilds/${guildId}/meta`,login.body.token);
+  assert.equal(meta.status,200,JSON.stringify(meta.body));
+  const chat = meta.body.channels.find(channel=>channel.id===chatChannelId);
+  assert.ok(chat);
+  const overwrite = chat.permissionOverwrites.find(
+    item=>item.id===targetRoleId&&item.type===0
+  );
+  assert.ok(overwrite,'selected role overwrite must survive a fresh meta read');
+  assert.equal(BigInt(overwrite.allow)&1024n,1024n,'view must be allowed');
+  assert.equal(BigInt(overwrite.deny)&2048n,2048n,'send must be denied');
+});

@@ -1,545 +1,3163 @@
-import type { Env } from "./types";
+import type { Env, GuildSettings, PaymentRow, ProductRow, SessionRow } from "./types";
 import {
-  ensureSchema, createDashboardSession, getDashboardSession, cleanExpiredSessions,
-  getGuildConfig, updateGuildConfig,
-  listPanels, createPanel, getPanel, updatePanelPost, listPanelButtons, createPanelButton, deletePanelButton, getPanelButton,
-  getAvConfig, upsertAvConfig, cleanExpiredAvSessions,
-  replaceBotGuildCache, listBotGuildCache,
-  listExternalAuths, insertExternalAuth, deleteExternalAuth,
+  DEFAULT_SETTINGS,
+  dashboardSessionStorageReady,
+  cleanExpired,
+  consumeOAuthState,
+  createDashboardSession,
+  createPayment,
+  createProduct,
+  createSession,
+  deleteDashboardSession,
+  deleteProduct,
+  deleteSession,
+  ensureSchema,
+  getAuditCursor,
+  getDashboardSession,
+  getGuildSettings,
+  getProduct,
+  getSession,
+  listAllGuildSettings,
+  listBotGuildCache,
+  listKnownGuildIds,
+  listPendingPayments,
+  listProducts,
+  markDelivered,
+  putOAuthState,
+  replaceBotGuildCache,
+  replaceBotGuildMembership,
+  saveGuildSettings,
+  setAuditCursor,
+  setPaymentStatus,
+  getAvConfig,
+  upsertAvConfig,
+  cleanExpiredAvSessions
 } from "./db";
-import { verifyInteraction, botJson, DiscordApiError, type DiscordChannel, type DiscordRole } from "./discord";
-import { sha256Hex, randomToken, corsHeaders, json, HttpError } from "./utils";
+import {
+  DiscordApiError,
+  botFetch,
+  botJson,
+  canManageGuild,
+  exchangeCode,
+  oauthAuthorizeUrl,
+  syncAutoMod,
+  userJson,
+  validAccessToken,
+  verifyInteraction,
+  type DiscordChannel,
+  type DiscordGuild,
+  type DiscordRole,
+  type DiscordUser
+} from "./discord";
+import { getPayPay } from "./vending-db";
+import { acceptPayPayLink, checkPayPayLink } from "./vending-payments";
+import {
+  BackupHttpError,
+  backupRestoreSweep,
+  createVerificationRecoveryAuthorizeUrl,
+  handleBackupApi,
+  handleRecoveryOAuth,
+  upgradeTrackedVerificationPanel,
+  verificationPublicOrigin,
+  verificationPanelPayload
+} from "./backup";
+import { recordPanelDeployment } from "./backup-db";
+import {
+  handleVendingApi,
+  handleVendingInteraction,
+  handleVendingMedia,
+  vendingSweep,
+  VendingHttpError
+} from "./vending";
+import {
+  memberActivitySweep,
+  getMemberActivitySettings,
+  primeMemberActivity,
+  saveMemberActivitySettings,
+  sendMemberActivityTest
+} from "./member-activity";
+import { retireDiscordGateway } from "./discord-gateway";
+import { handleGatewayRelay } from "./gateway-relay";
+import {
+  MEDIATION_COMMANDS,
+  MediationHttpError,
+  handleMediationApi,
+  handleMediationInteraction,
+  isMediationInteraction,
+  mediationShouldDefer,
+  mediationDefersAsUpdate,
+  mediationSweep
+} from "./mediation";
+export { DiscordGateway } from "./discord-gateway";
+// Discord-Security (統合): Security Gateway Durable Object と内部ブリッジ
+export { DiscordSecurityGateway } from "./security-integration";
+import { securityScheduled, withIntegratedSecurity } from "./security-integration";
+// Amazon自販機 (CC-server)
 import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal } from "./amazon-vending";
 import {
-  getSecurityOverview, updateSecuritySettings, triggerLockdown, releaseLockdown,
-  ensureSecurityGatewayRunning, runSecurityScheduled,
-} from "./security/service";
+  openSecurityMaintenanceLease,
+  securityBridgeConfigured,
+  securityBridgeJson
+} from "./security-bridge";
 import {
-  getServerEditorData, createChannel, patchChannel, reorderChannel, createRole, patchRole, deleteRole,
-  patchChannelPermission, bulkChannelPermissions,
-} from "./server-editor";
-import {
-  createBackup, listBackups, deleteBackup, previewRestore, startRestore, listRestoreJobs, getRestoreJobPublic, cancelRestore,
-} from "./backup";
-import {
-  getMemberActivitySettings, saveMemberActivitySettings, primeMemberActivity, sendMemberActivityTest,
-} from "./member-activity";
+  accountCreatedAt,
+  corsHeaders,
+  decrypt,
+  encrypt,
+  json,
+  parseCookie,
+  randomId,
+  randomToken,
+  sha256Hex,
+  snowflakeTime,
+  withCors
+} from "./utils";
 
-export { DiscordSecurityGateway } from "./security/gateway";
-
-// Invite / applications.commands + manage roles, channels, messages — the
-// permissions cc-server's features actually use.
-const BOT_PERMISSIONS = (
-  1n << 0n |   // CREATE_INSTANT_INVITE
-  1n << 4n |   // MANAGE_CHANNELS
-  1n << 10n |  // VIEW_CHANNEL
-  1n << 11n |  // SEND_MESSAGES
-  1n << 13n |  // MANAGE_MESSAGES
-  1n << 16n |  // READ_MESSAGE_HISTORY
-  1n << 28n |  // MANAGE_ROLES
-  1n << 2n |   // BAN_MEMBERS
-  1n << 5n     // MANAGE_GUILD (needed for backup/restore: guild settings + welcome screen)
+const BOT_PERMISSIONS=(
+  1n|32n|1024n|2048n|16384n|32768n|65536n|8192n|16n|134217728n|268435456n|
+  2n|4n|1099511627776n|128n
 ).toString();
 
-// ── auth ──────────────────────────────────────────────────────────────────────
+const DANGEROUS_PERMISSION_MASK=
+  8n|32n|16n|268435456n|536870912n|4n|2n;
 
-async function sessionFromRequest(request: Request, env: Env): Promise<void> {
-  const auth = request.headers.get("Authorization");
-  if (!auth?.startsWith("Bearer ")) throw new HttpError(401, "ログインが必要です");
-  const raw = auth.slice(7).trim();
-  const row = await getDashboardSession(env, await sha256Hex(raw));
-  if (!row) throw new HttpError(401, "セッションが失効しています");
+class HttpError extends Error {
+  constructor(public status:number,message:string){super(message);}
 }
 
-// ── Discord interaction handling ──────────────────────────────────────────────
-
-function interactionResponse(data: unknown): Response {
-  return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
-}
-
-function ephemeral(content: string): unknown {
-  return { type: 4, data: { content, flags: 64 } };
-}
-
-const STYLE_MAP: Record<string, number> = {
-  Primary: 1, Secondary: 2, Success: 3, Danger: 4,
+type DashboardActor={
+  user_id:string;
+  username:string;
+  avatar:null;
 };
 
-async function processInteraction(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const type = interaction.type as number;
-  const customId = String(interaction.data?.custom_id ?? "");
+async function sessionFromRequest(request:Request,env:Env):Promise<DashboardActor>{
+  const auth=request.headers.get("Authorization");
+  if(!auth?.startsWith("Bearer ")) throw new HttpError(401,"ログインが必要です");
+  const raw=auth.slice(7).trim();
+  const row=await getDashboardSession(env,await sha256Hex(raw));
+  if(!row) throw new HttpError(401,"セッションが失効しています");
+  return {user_id:"shared-dashboard",username:"共同管理者",avatar:null};
+}
 
-  // ping
-  if (type === 1) return interactionResponse({ type: 1 });
+async function requireMainSecurityLease(
+  env:Env,
+  guildId:string,
+  scope:"dashboard_edit"|"restore"="dashboard_edit",
+  seconds=30
+):Promise<void>{
+  if(!securityBridgeConfigured(env)) return;
+  try{
+    await openSecurityMaintenanceLease(env,guildId,scope,seconds);
+  }catch(error){
+    console.error("security maintenance lease failed",guildId,scope,error);
+    throw new HttpError(
+      503,
+      "Security Botとの安全な操作許可を確立できませんでした。誤検知防止のため操作を中止しました"
+    );
+  }
+}
 
-  // Amazon自販機 button: av:buy:<guildId>
-  if (type === 3 && customId.startsWith("av:buy:")) {
-    return handleAvBuyButton(interaction, env);
+async function repairMainBotChannelAccessViaSecurity(
+  env:Env,
+  guildId:string,
+  channelId:string
+):Promise<boolean>{
+  if(!securityBridgeConfigured(env)) return false;
+  try{
+    await securityBridgeJson(
+      env,
+      `/internal/guilds/${guildId}/main-bot/channels/${channelId}/access`,
+      {method:"POST",body:"{}"}
+    );
+    return true;
+  }catch(error){
+    console.error(
+      "Security Bot channel access recovery failed",
+      guildId,
+      channelId,
+      error
+    );
+    return false;
+  }
+}
+
+async function requireGuild(
+  request:Request,env:Env,guildId:string,_requireBot=true
+):Promise<{session:DashboardActor;guild:{id:string;name:string;icon:string|null}}>{
+  const session=await sessionFromRequest(request,env);
+  const guild=await botJson<{id:string;name:string;icon:string|null}>(env,`/guilds/${guildId}`);
+  if(request.method!=="GET"){
+    await requireMainSecurityLease(env,guildId,"dashboard_edit",30);
+  }
+  return {session,guild};
+}
+
+function bodyObject<T=Record<string,unknown>>(request:Request):Promise<T>{
+  return request.json() as Promise<T>;
+}
+
+type DiscordGuildMember={
+  roles:string[];
+  user?:{id?:string;bot?:boolean};
+};
+
+const PANEL_PERMISSION_MASK=1024n|2048n|16384n;
+const BOT_CHANNEL_GUARD_MASK=
+  PANEL_PERMISSION_MASK|32768n|65536n|8192n|16n|268435456n;
+
+function fallbackBotMember(
+  botId:string,
+  roles:DiscordRole[]
+):DiscordGuildMember{
+  return {
+    roles:roles
+      .filter(role=>role.tags?.bot_id===botId)
+      .map(role=>role.id)
+  };
+}
+
+async function getBotGuildMember(
+  env:Env,
+  guildId:string,
+  roles:DiscordRole[]
+):Promise<DiscordGuildMember>{
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+  try{
+    return await botJson<DiscordGuildMember>(
+      env,
+      `/guilds/${guildId}/members/${botId}`
+    );
+  }catch{
+    return fallbackBotMember(botId,roles);
+  }
+}
+
+function botBasePermissions(
+  guildId:string,
+  roles:DiscordRole[],
+  member:DiscordGuildMember
+):bigint{
+  let permissions=BigInt(
+    roles.find(role=>role.id===guildId)?.permissions??"0"
+  );
+  for(const roleId of member.roles){
+    const role=roles.find(item=>item.id===roleId);
+    if(role) permissions|=BigInt(role.permissions||"0");
+  }
+  return permissions;
+}
+
+function compareRoleHierarchy(a:DiscordRole,b:DiscordRole):number{
+  if(a.position!==b.position) return a.position>b.position?1:-1;
+  if(a.id===b.id) return 0;
+  // Discord permits duplicate role positions. For equal positions, roles are
+  // ordered by snowflake ID; this matches discord.js RoleManager comparison.
+  return BigInt(a.id)<BigInt(b.id)?1:-1;
+}
+
+function highestMemberRole(
+  roles:DiscordRole[],
+  member:DiscordGuildMember
+):DiscordRole|null{
+  let highest:DiscordRole|null=null;
+  for(const role of roles){
+    if(!member.roles.includes(role.id)) continue;
+    if(!highest||compareRoleHierarchy(role,highest)>0) highest=role;
+  }
+  return highest;
+}
+
+function botChannelPermissions(
+  guildId:string,
+  botId:string,
+  roles:DiscordRole[],
+  member:DiscordGuildMember,
+  channel:DiscordChannel
+):bigint{
+  let permissions=botBasePermissions(guildId,roles,member);
+  if((permissions&8n)===8n) return permissions|PANEL_PERMISSION_MASK;
+
+  const overwrites=channel.permission_overwrites??[];
+  const everyone=overwrites.find(
+    overwrite=>overwrite.id===guildId&&overwrite.type===0
+  );
+  if(everyone){
+    permissions&=~BigInt(everyone.deny||"0");
+    permissions|=BigInt(everyone.allow||"0");
   }
 
-  // Amazon自販機 modal: av:url_modal:<guildId>
-  if (type === 5 && customId.startsWith("av:url_modal:")) {
-    return handleAvUrlModal(interaction, env, ctx);
+  let roleAllow=0n;
+  let roleDeny=0n;
+  for(const roleId of member.roles){
+    const overwrite=overwrites.find(
+      item=>item.id===roleId&&item.type===0
+    );
+    if(!overwrite) continue;
+    roleAllow|=BigInt(overwrite.allow||"0");
+    roleDeny|=BigInt(overwrite.deny||"0");
+  }
+  permissions&=~roleDeny;
+  permissions|=roleAllow;
+
+  const memberOverwrite=overwrites.find(
+    overwrite=>overwrite.id===botId&&overwrite.type===1
+  );
+  if(memberOverwrite){
+    permissions&=~BigInt(memberOverwrite.deny||"0");
+    permissions|=BigInt(memberOverwrite.allow||"0");
   }
 
-  // Amazon自販機 select: av:select:<sessionId>
-  if (type === 3 && customId.startsWith("av:select:")) {
-    return handleAvSelect(interaction);
+  return permissions;
+}
+
+async function writeBotChannelGuard(
+  env:Env,
+  channel:DiscordChannel,
+  allow:bigint,
+  deny:bigint
+):Promise<void>{
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+  try{
+    await botJson<void>(
+      env,
+      `/channels/${channel.id}/permissions/${botId}`,
+      {
+        method:"PUT",
+        body:JSON.stringify({
+          type:1,
+          allow:allow.toString(),
+          deny:deny.toString()
+        })
+      }
+    );
+    return;
+  }catch(error){
+    if(!(error instanceof DiscordApiError)||error.status!==403) throw error;
   }
 
-  // Amazon自販機 next button: av:next:<sessionId>
-  if (type === 3 && customId.startsWith("av:next:")) {
-    return handleAvNext(interaction);
+  // A bot that has just lost View Channel can receive Missing Access from the
+  // single-overwrite endpoint. As a recovery path, preserve every canonical
+  // overwrite from the guild channel list and replace only this bot member's
+  // overwrite through Modify Channel.
+  const repairedOverwrites=[
+    ...(channel.permission_overwrites??[])
+      .filter(overwrite=>!(overwrite.id===botId&&overwrite.type===1))
+      .map(overwrite=>({
+        id:overwrite.id,
+        type:overwrite.type,
+        allow:overwrite.allow,
+        deny:overwrite.deny
+      })),
+    {
+      id:botId,
+      type:1,
+      allow:allow.toString(),
+      deny:deny.toString()
+    }
+  ];
+  await botJson<DiscordChannel>(
+    env,
+    `/channels/${channel.id}`,
+    {
+      method:"PATCH",
+      body:JSON.stringify({permission_overwrites:repairedOverwrites})
+    }
+  );
+}
+
+async function protectBotChannelAccess(
+  env:Env,
+  guildId:string,
+  channel:DiscordChannel
+):Promise<void>{
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+  const current=(channel.permission_overwrites??[]).find(
+    overwrite=>overwrite.id===botId&&overwrite.type===1
+  );
+  let allow=BigInt(current?.allow??"0");
+  let deny=BigInt(current?.deny??"0");
+  const alreadyProtected=
+    (allow&BOT_CHANNEL_GUARD_MASK)===BOT_CHANNEL_GUARD_MASK&&
+    (deny&BOT_CHANNEL_GUARD_MASK)===0n;
+  if(alreadyProtected) return;
+
+  allow|=BOT_CHANNEL_GUARD_MASK;
+  deny&=~BOT_CHANNEL_GUARD_MASK;
+
+  try{
+    await writeBotChannelGuard(env,channel,allow,deny);
+  }catch(error){
+    if(error instanceof DiscordApiError&&error.status===403){
+      if(await repairMainBotChannelAccessViaSecurity(env,guildId,channel.id)){
+        return;
+      }
+      throw new HttpError(
+        409,
+        "この変更を保存するとBOT自身がチャンネルから締め出される可能性があるため停止しました。対象カテゴリ/チャンネルでBOTの「チャンネルを見る」を許可し、BOTロールの「チャンネルの管理」「ロールの管理」を確認してください"
+      );
+    }
+    throw error;
+  }
+}
+
+type BotAccessRepairResult={
+  administrator:boolean;
+  checked:number;
+  repaired:number;
+  failed:Array<{id:string;name:string;status:number}>;
+};
+
+async function repairBotChannelAccess(
+  env:Env,
+  guildId:string
+):Promise<BotAccessRepairResult>{
+  const [roles,initialChannels]=await Promise.all([
+    botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`),
+    botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`)
+  ]);
+  const member=await getBotGuildMember(env,guildId,roles);
+  const administrator=(botBasePermissions(guildId,roles,member)&8n)===8n;
+  const supported=(channel:DiscordChannel)=>[0,2,4,5,13,15,16].includes(channel.type);
+  const initialSupported=initialChannels.filter(supported);
+  if(administrator){
+    return {administrator:true,checked:initialSupported.length,repaired:0,failed:[]};
   }
 
-  // Amazon自販機 address modal: av:addr_modal:<sessionId>[:<variantAsin>:<priceJpy>]
-  if (type === 5 && customId.startsWith("av:addr_modal:")) {
-    return handleAvAddrModal(interaction, env, ctx);
-  }
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+  const repairedIds=new Set<string>();
+  const failedById=new Map<string,{id:string;name:string;status:number}>();
+  let repairLeaseReady=false;
+  const ensureRepairLease=async()=>{
+    if(repairLeaseReady) return;
+    await requireMainSecurityLease(env,guildId,"dashboard_edit",180);
+    repairLeaseReady=true;
+  };
 
-  // Panel button: panel:<buttonId>
-  if (type === 3 && customId.startsWith("panel:")) {
-    await ensureSchema(env);
-    const btnId = parseInt(customId.slice(6), 10);
-    const btn = await getPanelButton(env, btnId);
-    if (!btn) return interactionResponse(ephemeral("このボタンは無効です。"));
+  const ensureGuard=async(channel:DiscordChannel)=>{
+    const current=(channel.permission_overwrites??[]).find(
+      overwrite=>overwrite.id===botId&&overwrite.type===1
+    );
+    let allow=BigInt(current?.allow??"0");
+    let deny=BigInt(current?.deny??"0");
+    const alreadyProtected=
+      (allow&BOT_CHANNEL_GUARD_MASK)===BOT_CHANNEL_GUARD_MASK&&
+      (deny&BOT_CHANNEL_GUARD_MASK)===0n;
+    if(alreadyProtected) return;
 
-    if (btn.action_type === "toggle_role") {
-      const guildId = String(interaction.guild_id ?? "");
-      const userId = String(interaction.member?.user?.id ?? "");
-      const roleId = btn.action_value;
-      const hasRole = (interaction.member?.roles as string[] ?? []).includes(roleId);
-      try {
-        if (hasRole) {
-          await botJson(env, `/guilds/${guildId}/members/${userId}/roles/${roleId}`, { method: "DELETE" });
-          return interactionResponse(ephemeral(`ロール <@&${roleId}> を外しました。`));
-        } else {
-          await botJson(env, `/guilds/${guildId}/members/${userId}/roles/${roleId}`, { method: "PUT" });
-          return interactionResponse(ephemeral(`ロール <@&${roleId}> を付与しました。`));
+    allow|=BOT_CHANNEL_GUARD_MASK;
+    deny&=~BOT_CHANNEL_GUARD_MASK;
+    try{
+      await ensureRepairLease();
+      await writeBotChannelGuard(env,channel,allow,deny);
+      repairedIds.add(channel.id);
+      failedById.delete(channel.id);
+    }catch(error){
+      if(error instanceof DiscordApiError){
+        if(
+          error.status===403&&
+          await repairMainBotChannelAccessViaSecurity(env,guildId,channel.id)
+        ){
+          repairedIds.add(channel.id);
+          failedById.delete(channel.id);
+          return;
         }
-      } catch (err) {
-        if (err instanceof DiscordApiError && err.status === 403) {
-          return interactionResponse(ephemeral("BOTの権限が不足しています。"));
+        failedById.set(channel.id,{
+          id:channel.id,
+          name:channel.name,
+          status:error.status
+        });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  // Protect categories first. Discord propagates category permission changes to
+  // channels that are still synchronized with that category. We then refetch so
+  // synchronized children are not unnecessarily given their own overwrite.
+  for(const category of initialSupported.filter(channel=>channel.type===4)){
+    await ensureGuard(category);
+  }
+
+  // Only refetch after a category was actually changed. In steady state this
+  // keeps the scheduled guard lightweight, while still preserving category
+  // synchronization when a repair propagates to child channels.
+  const channelsForChildren=repairedIds.size>0
+    ?await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`)
+    :initialChannels;
+  for(const channel of channelsForChildren.filter(
+    item=>supported(item)&&item.type!==4
+  )){
+    await ensureGuard(channel);
+  }
+
+  return {
+    administrator:false,
+    checked:channelsForChildren.filter(supported).length,
+    repaired:repairedIds.size,
+    failed:[...failedById.values()]
+  };
+}
+
+async function botAccessGuardSweep(env:Env):Promise<void>{
+  // Do not consume Discord's /users/@me/guilds rate-limit bucket from the
+  // every-minute cron. The dashboard owns live guild-list refreshes; the guard
+  // can safely operate on recently cached/known guild IDs.
+  const [cached,configured]=await Promise.all([
+    listBotGuildCache(env,24*60*60_000).catch(()=>[]),
+    listAllGuildSettings(env,200).catch(()=>[])
+  ]);
+  const guildIds=[...new Set([
+    ...cached.map(guild=>guild.id),
+    ...configured.map(row=>row.guild_id)
+  ])];
+
+  for(const guildId of guildIds){
+    try{
+      const result=await repairBotChannelAccess(env,guildId);
+      if(result.failed.length>0){
+        console.warn(
+          "bot access guard: repair incomplete",
+          guildId,
+          result.failed
+        );
+      }
+    }catch(error){
+      console.error("bot access guard: guild repair failed",guildId,error);
+    }
+  }
+}
+
+type ChannelPermissionKey=
+  "view"|"send"|"history"|"react"|"files"|"embeds"|"appCommands"|"polls"|
+  "createPublicThreads"|"createPrivateThreads"|"sendInThreads"|"manageThreads"|
+  "manageMessages"|"mentionEveryone"|"externalEmojis"|"externalStickers"|
+  "voiceMessages"|"createInvite"|"manageWebhooks"|"pinMessages"|"bypassSlowmode"|
+  "connect"|"speak"|"stream"|"useVad"|"soundboard"|"externalSounds"|
+  "setVoiceStatus"|"prioritySpeaker"|"muteMembers"|"deafenMembers"|"moveMembers"|
+  "threads";
+type ChannelPermissionMode="inherit"|"allow"|"deny";
+type ChannelPermissionPatch=Partial<Record<ChannelPermissionKey,ChannelPermissionMode>>;
+
+const CHANNEL_PERMISSION_BITS:Record<ChannelPermissionKey,bigint>={
+  view:1024n,
+  send:2048n,
+  history:65536n,
+  react:64n,
+  files:32768n,
+  embeds:16384n,
+  appCommands:2147483648n,
+  polls:562949953421312n,
+  createPublicThreads:34359738368n,
+  createPrivateThreads:68719476736n,
+  sendInThreads:274877906944n,
+  manageThreads:17179869184n,
+  manageMessages:8192n,
+  mentionEveryone:131072n,
+  externalEmojis:262144n,
+  externalStickers:137438953472n,
+  voiceMessages:70368744177664n,
+  createInvite:1n,
+  manageWebhooks:536870912n,
+  pinMessages:2251799813685248n,
+  bypassSlowmode:4503599627370496n,
+  connect:1048576n,
+  speak:2097152n,
+  stream:512n,
+  useVad:33554432n,
+  soundboard:4398046511104n,
+  externalSounds:35184372088832n,
+  setVoiceStatus:281474976710656n,
+  prioritySpeaker:256n,
+  muteMembers:4194304n,
+  deafenMembers:8388608n,
+  moveMembers:16777216n,
+  threads:34359738368n
+};
+
+async function botFetchInteractive(
+  env:Env,
+  path:string,
+  init:RequestInit={}
+):Promise<Response>{
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),7_000);
+  try{
+    const response=await botFetch(env,path,{...init,signal:controller.signal});
+    if(response.status===429){
+      const raw=await response.text().catch(()=>"");
+      let retryAfterSeconds:number|null=null;
+      try{
+        const payload=JSON.parse(raw) as {retry_after?:number};
+        if(typeof payload.retry_after==="number"&&Number.isFinite(payload.retry_after)){
+          retryAfterSeconds=Math.max(1,Math.ceil(payload.retry_after));
         }
-        throw err;
+      }catch{
+        const header=response.headers.get("Retry-After");
+        const parsed=header?Number(header):NaN;
+        if(Number.isFinite(parsed)) retryAfterSeconds=Math.max(1,Math.ceil(parsed));
+      }
+      throw new HttpError(
+        429,
+        retryAfterSeconds
+          ? `Discordのレート制限中です。約${retryAfterSeconds}秒後にもう一度保存してください`
+          : "Discordのレート制限中です。少し待ってもう一度保存してください"
+      );
+    }
+    return response;
+  }catch(error){
+    if(controller.signal.aborted){
+      throw new HttpError(
+        504,
+        "Discord APIの応答が7秒以内に返りませんでした。権限変更は確定していないため、もう一度保存してください"
+      );
+    }
+    throw error;
+  }finally{
+    clearTimeout(timeoutId);
+  }
+}
+
+async function applyChannelRolePermissionsFast(
+  env:Env,
+  guildId:string,
+  channel:DiscordChannel,
+  targetId:string,
+  permissions:ChannelPermissionPatch
+):Promise<{allow:string;deny:string;changed:boolean}>{
+  if(channel.guild_id&&channel.guild_id!==guildId){
+    throw new HttpError(404,"対象チャンネルがこのサーバーに見つかりません");
+  }
+
+  // Denying View Channel can immediately hide the channel from the bot.
+  // Protect the bot with a direct member overwrite before applying the role deny.
+  if(permissions.view==="deny"){
+    const botId=env.DISCORD_APPLICATION_ID.trim();
+    const botOverwrite=(channel.permission_overwrites??[]).find(
+      overwrite=>overwrite.id===botId&&overwrite.type===1
+    );
+    let botAllow=BigInt(botOverwrite?.allow??"0");
+    let botDeny=BigInt(botOverwrite?.deny??"0");
+    const protectedAlready=
+      (botAllow&BOT_CHANNEL_GUARD_MASK)===BOT_CHANNEL_GUARD_MASK&&
+      (botDeny&BOT_CHANNEL_GUARD_MASK)===0n;
+
+    if(!protectedAlready){
+      botAllow|=BOT_CHANNEL_GUARD_MASK;
+      botDeny&=~BOT_CHANNEL_GUARD_MASK;
+      const guardResponse=await botFetchInteractive(
+        env,
+        `/channels/${channel.id}/permissions/${botId}`,
+        {
+          method:"PUT",
+          body:JSON.stringify({
+            type:1,
+            allow:botAllow.toString(),
+            deny:botDeny.toString()
+          })
+        }
+      );
+      if(!guardResponse.ok){
+        const detail=await guardResponse.text().catch(()=>"");
+        if(guardResponse.status===403){
+          throw new HttpError(
+            409,
+            "BOTのアクセス保護を設定できないため保存を停止しました。BOTロールに「チャンネルの管理」と「ロールの管理」を許可してください"
+          );
+        }
+        throw new DiscordApiError(
+          guardResponse.status,
+          "Discord API "+guardResponse.status+": "+detail.slice(0,300)
+        );
       }
     }
+  }
 
-    if (btn.action_type === "show_text") {
-      return interactionResponse(ephemeral(btn.action_value.slice(0, 2000)));
+  const current=(channel.permission_overwrites??[]).find(
+    overwrite=>overwrite.id===targetId&&overwrite.type===0
+  );
+  let allow=BigInt(current?.allow??"0");
+  let deny=BigInt(current?.deny??"0");
+  const beforeAllow=allow;
+  const beforeDeny=deny;
+
+  for(const [rawKey,mode] of Object.entries(permissions)){
+    if(!(rawKey in CHANNEL_PERMISSION_BITS)) continue;
+    if(mode!=="inherit"&&mode!=="allow"&&mode!=="deny") continue;
+    const bit=CHANNEL_PERMISSION_BITS[rawKey as ChannelPermissionKey];
+    allow&=~bit;
+    deny&=~bit;
+    if(mode==="allow") allow|=bit;
+    if(mode==="deny") deny|=bit;
+  }
+
+  if(allow===beforeAllow&&deny===beforeDeny){
+    return {allow:allow.toString(),deny:deny.toString(),changed:false};
+  }
+
+  const response=
+    allow===0n&&deny===0n
+      ? current
+        ? await botFetchInteractive(
+            env,
+            `/channels/${channel.id}/permissions/${targetId}`,
+            {method:"DELETE"}
+          )
+        : null
+      : await botFetchInteractive(
+          env,
+          `/channels/${channel.id}/permissions/${targetId}`,
+          {
+            method:"PUT",
+            body:JSON.stringify({
+              type:0,
+              allow:allow.toString(),
+              deny:deny.toString()
+            })
+          }
+        );
+
+  if(response&&!response.ok){
+    const detail=await response.text().catch(()=>"");
+    if(response.status===403){
+      throw new HttpError(
+        403,
+        "Discordが権限変更を拒否しました。BOTロールの「チャンネルの管理」と「ロールの管理」、および対象チャンネルへのアクセスを確認してください"
+      );
+    }
+    throw new DiscordApiError(
+      response.status,
+      "Discord API "+response.status+": "+detail.slice(0,300)
+    );
+  }
+
+  return {allow:allow.toString(),deny:deny.toString(),changed:true};
+}
+
+async function applyChannelRolePermissions(
+  env:Env,
+  guildId:string,
+  channel:DiscordChannel,
+  targetId:string,
+  roles:DiscordRole[],
+  member:DiscordGuildMember,
+  permissions:ChannelPermissionPatch
+):Promise<{allow:string;deny:string}>{
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+  const botAdministrator=(botBasePermissions(guildId,roles,member)&8n)===8n;
+
+  if(!botAdministrator&&targetId!==botId){
+    const targetCanAffectBot=targetId===guildId||member.roles.includes(targetId);
+    if(targetCanAffectBot){
+      const effective=botChannelPermissions(
+        guildId,
+        botId,
+        roles,
+        member,
+        channel
+      );
+      const botCanManageChannel=
+        (effective&16n)===16n||
+        (botBasePermissions(guildId,roles,member)&16n)===16n;
+      if(!botCanManageChannel){
+        throw new HttpError(
+          409,
+          "このチャンネルの権限を変更するとBOT自身が締め出される可能性があります。対象カテゴリ/チャンネルでBOTの「チャンネルを見る」を許可し、BOTロールの「チャンネルの管理」を確認してください"
+        );
+      }
+      await protectBotChannelAccess(env,guildId,channel);
+    }
+  }
+
+  const current=(channel.permission_overwrites??[]).find(
+    overwrite=>overwrite.id===targetId&&overwrite.type===0
+  );
+  let allow=BigInt(current?.allow??"0");
+  let deny=BigInt(current?.deny??"0");
+
+  for(const [rawKey,mode] of Object.entries(permissions)){
+    if(!(rawKey in CHANNEL_PERMISSION_BITS)) continue;
+    if(mode!=="inherit"&&mode!=="allow"&&mode!=="deny") continue;
+    const key=rawKey as ChannelPermissionKey;
+    const bit=CHANNEL_PERMISSION_BITS[key];
+    allow&=~bit;
+    deny&=~bit;
+    if(mode==="allow") allow|=bit;
+    if(mode==="deny") deny|=bit;
+  }
+
+  try{
+    if(allow===0n&&deny===0n){
+      if(current){
+        const response=await botFetch(
+          env,
+          `/channels/${channel.id}/permissions/${targetId}`,
+          {method:"DELETE"}
+        );
+        if(!response.ok){
+          const detail=await response.text().catch(()=>"");
+          throw new DiscordApiError(
+            response.status,
+            "Discord API "+response.status+": "+detail.slice(0,300)
+          );
+        }
+      }
+    }else{
+      await botJson(
+        env,
+        `/channels/${channel.id}/permissions/${targetId}`,
+        {
+          method:"PUT",
+          body:JSON.stringify({
+            type:0,
+            allow:allow.toString(),
+            deny:deny.toString()
+          })
+        }
+      );
+    }
+  }catch(error){
+    if(error instanceof DiscordApiError&&error.status===403){
+      throw new HttpError(
+        403,
+        "Discordがこのチャンネルの権限変更を拒否しました。対象カテゴリ/チャンネルでBOTの「チャンネルを見る」を許可し、BOTロールの「チャンネルの管理」「ロールの管理」を確認してください"
+      );
+    }
+    throw error;
+  }
+
+  return {allow:allow.toString(),deny:deny.toString()};
+}
+
+function channelPermissionPatchMatches(
+  channel:DiscordChannel,
+  targetId:string,
+  permissions:ChannelPermissionPatch
+):boolean{
+  const overwrite=(channel.permission_overwrites??[]).find(
+    item=>item.id===targetId&&item.type===0
+  );
+  const allow=BigInt(overwrite?.allow??"0");
+  const deny=BigInt(overwrite?.deny??"0");
+
+  for(const [rawKey,mode] of Object.entries(permissions)){
+    if(!(rawKey in CHANNEL_PERMISSION_BITS)) continue;
+    if(mode!=="inherit"&&mode!=="allow"&&mode!=="deny") continue;
+    const bit=CHANNEL_PERMISSION_BITS[rawKey as ChannelPermissionKey];
+    if(mode==="allow"&&((allow&bit)!==bit||(deny&bit)!==0n)) return false;
+    if(mode==="deny"&&((deny&bit)!==bit||(allow&bit)!==0n)) return false;
+    if(mode==="inherit"&&((allow&bit)!==0n||(deny&bit)!==0n)) return false;
+  }
+  return true;
+}
+
+async function discordMeta(env:Env,guildId:string){
+  let channels:DiscordChannel[];
+  let roles:DiscordRole[];
+  let member:DiscordGuildMember;
+
+  const channelsPromise=botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+  const rolesPromise=botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`);
+  // スレッドはプレビュー表示用。取得できなくてもチャンネル編集は続けられるようにする
+  const threadsPromise=botJson<{threads?:Array<DiscordChannel&{thread_metadata?:{archived?:boolean;locked?:boolean}}>}>(
+    env,`/guilds/${guildId}/threads/active`
+  ).then(result=>result.threads??[]).catch(error=>{
+    console.error("active thread list failed",guildId,error);
+    return [] as Array<DiscordChannel&{thread_metadata?:{archived?:boolean;locked?:boolean}}>;
+  });
+
+  try{
+    channels=await channelsPromise;
+  }catch(error){
+    const detail=error instanceof Error?error.message:String(error);
+    throw new HttpError(502,"Discordチャンネル一覧の取得に失敗しました: "+detail.slice(0,220));
+  }
+
+  try{
+    roles=await rolesPromise;
+  }catch(error){
+    const detail=error instanceof Error?error.message:String(error);
+    throw new HttpError(502,"Discordロール一覧の取得に失敗しました: "+detail.slice(0,220));
+  }
+
+  member=await getBotGuildMember(env,guildId,roles);
+  const activeThreads=await threadsPromise;
+
+  const basePermissions=botBasePermissions(guildId,roles,member);
+  const botAdministrator=(basePermissions&8n)===8n;
+  const botId=env.DISCORD_APPLICATION_ID.trim();
+
+  return {
+    botAdministrator,
+    channels:channels
+      .filter(c=>[0,2,5,13,15,16].includes(c.type))
+      .sort((a,b)=>(a.position??0)-(b.position??0))
+      .map(c=>{
+        const effective=botChannelPermissions(guildId,botId,roles,member,c);
+        const botCanView=(effective&1024n)===1024n;
+        const botCanPost=
+          botCanView&&
+          (effective&2048n)===2048n&&
+          (effective&16384n)===16384n;
+        return {
+          id:c.id,
+          name:c.name,
+          type:
+            c.type===2?"voice":
+            c.type===5?"announcement":
+            c.type===13?"stage":
+            c.type===15?"forum":
+            c.type===16?"media":"text",
+          parentId:c.parent_id??null,
+          topic:c.topic??"",
+          position:c.position??0,
+          botCanView,
+          botCanPost,
+          permissionOverwrites:(c.permission_overwrites??[]).map(overwrite=>({
+            id:overwrite.id,
+            type:overwrite.type,
+            allow:overwrite.allow,
+            deny:overwrite.deny
+          }))
+        };
+      }),
+    categories:channels
+      .filter(c=>c.type===4)
+      .sort((a,b)=>(a.position??0)-(b.position??0)||(BigInt(a.id)<BigInt(b.id)?-1:1))
+      .map(c=>({
+        id:c.id,
+        name:c.name,
+        position:c.position??0
+      })),
+    threads:activeThreads
+      .filter(t=>[10,11,12].includes(t.type)&&t.parent_id)
+      .sort((a,b)=>(BigInt(a.id)<BigInt(b.id)?-1:1))
+      .map(t=>({
+        id:t.id,
+        name:t.name,
+        parentId:t.parent_id??null,
+        type:t.type===12?"private":t.type===10?"announcement":"public",
+        archived:Boolean(t.thread_metadata?.archived),
+        locked:Boolean(t.thread_metadata?.locked)
+      })),
+    roles:roles
+      .filter(r=>!r.managed)
+      .sort((a,b)=>b.position-a.position)
+      .map(r=>({
+        id:r.id,
+        name:r.name,
+        position:r.position,
+        color:r.color??0,
+        permissions:r.permissions,
+        isEveryone:r.id===guildId
+      }))
+  };
+}
+
+async function sendMessage(
+  env:Env,channelId:string,payload:unknown
+):Promise<{id?:string}>{
+  return botJson<{id?:string}>(env,`/channels/${channelId}/messages`,{
+    method:"POST",
+    body:JSON.stringify(payload)
+  });
+}
+
+async function sendPanelMessage(
+  env:Env,
+  guildId:string,
+  channelId:string,
+  payload:unknown
+):Promise<{id?:string}>{
+  try{
+    return await sendMessage(env,channelId,payload);
+  }catch(error){
+    if(error instanceof DiscordApiError&&error.status===403){
+      throw new HttpError(
+        403,
+        "BOTがこのチャンネルから締め出されています。対象カテゴリ/チャンネルの権限にBOTを追加して「チャンネルを見る」を一度許可し、管理画面を再読み込みしてください。以後はBOTアクセス保護を自動適用します。Administratorは必須ではありません"
+      );
+    }
+    throw error;
+  }
+}
+
+async function publishVerificationPanel(
+  env:Env,guildId:string,channelId:string,workerOrigin:string
+){
+  const message=await sendPanelMessage(
+    env,guildId,channelId,verificationPanelPayload(verificationPublicOrigin(env,workerOrigin),guildId)
+  );
+  await recordPanelDeployment(env,{
+    guildId,kind:"verification",channelId,messageId:message.id??null
+  });
+}
+
+async function publishTicketPanel(env:Env,guildId:string,channelId:string){
+  const message=await sendPanelMessage(env,guildId,channelId,{
+    embeds:[{
+      title:"サポート",
+      description:"問い合わせ用チケットを作成します。",
+      color:5793266
+    }],
+    components:[{
+      type:1,
+      components:[{
+        type:2,
+        custom_id:"ticket:create",
+        label:"チケットを作成",
+        style:1
+      }]
+    }]
+  });
+  await recordPanelDeployment(env,{
+    guildId,kind:"ticket",channelId,messageId:message.id??null
+  });
+}
+
+async function requireMessageChannel(env:Env,guildId:string,channelId:string):Promise<void>{
+  if(!/^\d+$/.test(channelId)) throw new HttpError(400,"設置先チャンネルが不正です");
+
+  let channels:DiscordChannel[];
+  try{
+    channels=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+  }catch(error){
+    const detail=error instanceof Error?error.message:String(error);
+    throw new HttpError(
+      502,
+      "設置先チャンネル一覧の取得に失敗しました: "+detail.slice(0,220)
+    );
+  }
+
+  const channel=channels.find(item=>item.id===channelId);
+  if(!channel){
+    throw new HttpError(
+      404,
+      "設置先チャンネルが見つかりません。チャンネル一覧を再読み込みしてください"
+    );
+  }
+  if(![0,5].includes(channel.type)){
+    throw new HttpError(
+      400,
+      "パネルはテキストまたはアナウンスチャンネルに設置してください"
+    );
+  }
+}
+
+async function publishProductPanel(env:Env,guildId:string,channelId:string,product:ProductRow){
+  const message=await sendMessage(env,channelId,{
+    embeds:[{
+      title:product.name,
+      description:product.description||"購入ボタンからPayPay決済へ進めます。",
+      color:443221,
+      fields:[{name:"価格",value:`¥${product.price_yen.toLocaleString("ja-JP")}`}]
+    }],
+    components:[{
+      type:1,
+      components:[{
+        type:2,
+        custom_id:`buy:${product.id}`,
+        label:"PayPayで購入",
+        style:3
+      }]
+    }]
+  });
+  await recordPanelDeployment(env,{
+    guildId,kind:"product",objectId:product.id,channelId,messageId:message.id??null
+  });
+}
+
+async function ensureRole(env:Env,guildId:string,name:string,permissions="0"):Promise<DiscordRole>{
+  const roles=await botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`);
+  const existing=roles.find(r=>r.name===name);
+  if(existing) return existing;
+  return botJson(env,`/guilds/${guildId}/roles`,{
+    method:"POST",
+    body:JSON.stringify({name,permissions})
+  });
+}
+
+async function ensureCategory(env:Env,guildId:string,name:string):Promise<DiscordChannel>{
+  const channels=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+  const existing=channels.find(c=>c.type===4&&c.name===name);
+  if(existing) return existing;
+  return botJson(env,`/guilds/${guildId}/channels`,{
+    method:"POST",
+    body:JSON.stringify({
+      name,
+      type:4,
+      permission_overwrites:[{
+        id:env.DISCORD_APPLICATION_ID.trim(),
+        type:1,
+        allow:BOT_CHANNEL_GUARD_MASK.toString()
+      }]
+    })
+  });
+}
+
+async function ensureText(
+  env:Env,guildId:string,name:string,parentId:string,
+  options?:{readOnly?:boolean;privateRoleId?:string}
+):Promise<void>{
+  const channels=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+  if(channels.some(c=>c.type===0&&c.name===name&&c.parent_id===parentId)) return;
+  const overwrites:Array<Record<string,unknown>>=[{
+    id:env.DISCORD_APPLICATION_ID.trim(),
+    type:1,
+    allow:BOT_CHANNEL_GUARD_MASK.toString()
+  }];
+  if(options?.readOnly){
+    overwrites.push({id:guildId,type:0,deny:"2048"});
+  }
+  if(options?.privateRoleId){
+    overwrites.push(
+      {id:guildId,type:0,deny:"1024"},
+      {id:options.privateRoleId,type:0,allow:(1024n|2048n|65536n).toString()}
+    );
+  }
+  await botJson(env,`/guilds/${guildId}/channels`,{
+    method:"POST",
+    body:JSON.stringify({
+      name,type:0,parent_id:parentId,
+      permission_overwrites:overwrites
+    })
+  });
+}
+
+async function applyTemplate(env:Env,guildId:string,template:string){
+  if(template==="community"){
+    const verified=await ensureRole(env,guildId,"Verified");
+    const moderator=await ensureRole(env,guildId,"Moderator",(8192n|1099511627776n|2n).toString());
+    const start=await ensureCategory(env,guildId,"START HERE");
+    const community=await ensureCategory(env,guildId,"COMMUNITY");
+    const staff=await ensureCategory(env,guildId,"STAFF");
+    await ensureText(env,guildId,"welcome",start.id,{readOnly:true});
+    await ensureText(env,guildId,"rules",start.id,{readOnly:true});
+    await ensureText(env,guildId,"general",community.id);
+    await ensureText(env,guildId,"media",community.id);
+    await ensureText(env,guildId,"staff-chat",staff.id,{privateRoleId:moderator.id});
+    await saveGuildSettings(env,guildId,{verifiedRoleId:verified.id});
+    return;
+  }
+  if(template==="shop"){
+    await ensureRole(env,guildId,"Customer");
+    const support=await ensureRole(env,guildId,"Support",(8192n|1099511627776n).toString());
+    const shop=await ensureCategory(env,guildId,"SHOP");
+    const help=await ensureCategory(env,guildId,"SUPPORT");
+    await ensureText(env,guildId,"announcements",shop.id,{readOnly:true});
+    await ensureText(env,guildId,"products",shop.id,{readOnly:true});
+    await ensureText(env,guildId,"orders",shop.id);
+    await ensureText(env,guildId,"open-ticket",help.id);
+    await ensureText(env,guildId,"support-staff",help.id,{privateRoleId:support.id});
+    return;
+  }
+  const support=await ensureRole(env,guildId,"Support",(8192n|1099511627776n).toString());
+  const category=await ensureCategory(env,guildId,"SUPPORT");
+  await ensureText(env,guildId,"faq",category.id,{readOnly:true});
+  await ensureText(env,guildId,"open-ticket",category.id);
+  await ensureText(env,guildId,"staff-support",category.id,{privateRoleId:support.id});
+}
+
+function interactionResponse(data:unknown):Response{
+  return new Response(JSON.stringify(data),{
+    headers:{"Content-Type":"application/json"}
+  });
+}
+
+function ephemeral(content:string,components?:unknown[]){
+  return {
+    type:4,
+    data:{
+      content,
+      flags:64,
+      ...(components?{components}:{})
+    }
+  };
+}
+
+function deferredEphemeral():Response{
+  return interactionResponse({
+    type:5,
+    data:{flags:64}
+  });
+}
+
+function interactionCustomId(interaction:any):string{
+  return String(interaction?.data?.custom_id??"");
+}
+
+function isVendingInteraction(interaction:any):boolean{
+  return (
+    (interaction?.type===3||interaction?.type===5)&&
+    interactionCustomId(interaction).startsWith("vm:")
+  );
+}
+
+function shouldDeferInteraction(interaction:any):boolean{
+  if(isMediationInteraction(interaction)) return mediationShouldDefer(interaction);
+  const id=interactionCustomId(interaction);
+  if(interaction?.type===2){
+    return interaction?.data?.name==="security-status";
+  }
+  if(interaction?.type===3){
+    if(
+      id==="ticket:create"||
+      id.startsWith("verify:start:")
+    ) return true;
+
+    if(id.startsWith("vm:")){
+      // These two component actions must return a modal as the initial response,
+      // so they cannot be deferred.
+      if(id.startsWith("vm:product:")||id.startsWith("vm:pay:")) return false;
+      return true;
+    }
+  }
+
+  // Vending modal submissions can involve D1, external payment APIs and Discord
+  // REST calls. Always acknowledge them first and finish in the background.
+  return interaction?.type===5&&(id.startsWith("vm:")||id.startsWith("buyl:"));
+}
+
+async function patchOriginalInteraction(
+  interaction:any,
+  data:Record<string,unknown>
+):Promise<void>{
+  const applicationId=String(interaction?.application_id??"");
+  const token=String(interaction?.token??"");
+  if(!applicationId||!token) throw new Error("interaction callback metadata missing");
+
+  const url=
+    "https://discord.com/api/v10/webhooks/"+
+    encodeURIComponent(applicationId)+"/"+
+    encodeURIComponent(token)+
+    "/messages/@original";
+
+  let lastError:unknown=null;
+  for(let attempt=0;attempt<2;attempt++){
+    const controller=new AbortController();
+    let timeoutId:ReturnType<typeof setTimeout>|undefined;
+    try{
+      const request=fetch(url,{
+        method:"PATCH",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(data),
+        signal:controller.signal
+      });
+      const timeout=new Promise<Response>((_,reject)=>{
+        timeoutId=setTimeout(()=>{
+          controller.abort();
+          reject(new Error("deferred interaction update timed out"));
+        },5_000);
+      });
+      const response=await Promise.race([request,timeout]);
+      if(!response.ok){
+        const detail=await response.text().catch(()=>"");
+        throw new Error(
+          "Discord deferred update "+response.status+": "+detail.slice(0,240)
+        );
+      }
+      return;
+    }catch(error){
+      lastError=error;
+      if(attempt===0) await new Promise(resolve=>setTimeout(resolve,150));
+    }finally{
+      if(timeoutId!==undefined) clearTimeout(timeoutId);
+    }
+  }
+  throw lastError instanceof Error?lastError:new Error(String(lastError));
+}
+
+async function finishDeferredInteraction(
+  interaction:any,
+  result:Response
+):Promise<void>{
+  let payload:any=null;
+  try{
+    payload=await result.json();
+  }catch{
+    // Fall through to a safe generic message.
+  }
+
+  if(payload?.type===4&&payload?.data){
+    const data={...payload.data};
+    delete data.flags;
+    await patchOriginalInteraction(interaction,data);
+    return;
+  }
+
+  await patchOriginalInteraction(interaction,{
+    content:"処理は完了しました。",
+    components:[]
+  });
+}
+
+function deferredInteractionErrorMessage(error:unknown):string{
+  if(error instanceof HttpError) return error.message;
+  if(error instanceof DiscordApiError){
+    if(error.status===403){
+      return "Discord側で操作を拒否されました。BOTロールの「チャンネルの管理」「チャンネルを見る」「メッセージを送信」を確認して、もう一度お試しください。";
+    }
+    if(error.status===429){
+      return "Discordのレート制限中です。少し待ってからもう一度お試しください。";
+    }
+  }
+  return "処理中にエラーが発生しました。もう一度お試しください。";
+}
+
+async function failDeferredInteraction(
+  interaction:any,
+  error:unknown
+):Promise<void>{
+  console.error("deferred interaction failed",{
+    interactionId:String(interaction?.id??""),
+    type:interaction?.type,
+    customId:interactionCustomId(interaction),
+    error:error instanceof Error?error.message:String(error)
+  });
+  try{
+    await patchOriginalInteraction(interaction,{
+      content:deferredInteractionErrorMessage(error),
+      components:[]
+    });
+  }catch(updateError){
+    console.error(
+      "deferred interaction error response failed",
+      updateError instanceof Error?updateError.message:String(updateError)
+    );
+  }
+}
+
+async function deliverPayment(env:Env,payment:PaymentRow):Promise<void>{
+  if(payment.delivered_at) return;
+  const product=await getProduct(env,payment.product_id);
+  if(!product) throw new Error("Product missing");
+  if(product.delivery_type==="role"){
+    if(!product.role_id) throw new Error("Role product misconfigured");
+    await botJson(env,`/guilds/${payment.guild_id}/members/${payment.user_id}/roles/${product.role_id}`,{
+      method:"PUT"
+    });
+  }else{
+    if(!product.delivery_text) throw new Error("Text product misconfigured");
+    const dm=await botJson<{id:string}>(env,"/users/@me/channels",{
+      method:"POST",
+      body:JSON.stringify({recipient_id:payment.user_id})
+    });
+    await sendMessage(env,dm.id,{
+      content:`「${product.name}」の購入ありがとうございます。\n\n${product.delivery_text}`
+    });
+  }
+  await markDelivered(env,payment.id);
+}
+
+// Shop payments are PayPay send-money links received with the shared seller's stored
+// PayPaython-style web session (saved login + client_uuid, no OTP). No merchant/OPA API.
+const SHOP_PAYPAY_OWNER="shared-dashboard";
+
+async function confirmAndDeliver(env:Env,payment:PaymentRow):Promise<string>{
+  if(payment.status==="COMPLETED"){
+    await deliverPayment(env,payment);
+    return "COMPLETED";
+  }
+  if(!payment.paypay_url||(payment.status!=="CREATED"&&payment.status!=="PENDING")) return payment.status;
+  const claimed=await env.DB.prepare(
+    "UPDATE payments SET status='PROCESSING',updated_at=? WHERE id=? AND status IN ('CREATED','PENDING')"
+  ).bind(Date.now(),payment.id).run();
+  if((claimed.meta.changes??0)!==1) return "PROCESSING";
+
+  const link=await decrypt(env.SESSION_ENCRYPTION_KEY,payment.paypay_url);
+  let status="PENDING";
+  let reason="";
+  try{
+    const account=await getPayPay(env,SHOP_PAYPAY_OWNER,env.SESSION_ENCRYPTION_KEY);
+    if(account){
+      const result=await acceptPayPayLink(link,account);
+      status=result.ok?"COMPLETED":result.pending?"PENDING":"FAILED";
+      reason=result.status;
+    }else{
+      reason="LOGIN_REQUIRED";
+    }
+  }catch(error){
+    console.error("shop payment accept failed",error);
+  }
+  await setPaymentStatus(env,payment.id,status);
+  if(status==="FAILED"){
+    await env.DB.prepare("DELETE FROM vending_used_payment_links WHERE link_hash=? AND order_id=?")
+      .bind(await sha256Hex(link),payment.id).run();
+  }
+  if(status==="COMPLETED") await deliverPayment(env,{...payment,status});
+  return status==="PENDING"&&reason==="LOGIN_REQUIRED"?"LOGIN_REQUIRED":status;
+}
+
+async function submitShopLink(interaction:any,env:Env):Promise<Response>{
+  await ensureSchema(env);
+  const product=await getProduct(env,String(interaction.data.custom_id).slice("buyl:".length));
+  if(!product||!product.active||product.guild_id!==interaction.guild_id){
+    return interactionResponse(ephemeral("この商品は現在購入できません。"));
+  }
+  const link=String(interaction.data.components?.[0]?.components?.[0]?.value??"").trim();
+  if(!/^https:\/\/pay\.paypay\.ne\.jp\/[A-Za-z0-9]+/.test(link)){
+    return interactionResponse(ephemeral("PayPayの送金リンクを入力してください。"));
+  }
+  if(!(await getPayPay(env,SHOP_PAYPAY_OWNER,env.SESSION_ENCRYPTION_KEY))){
+    return interactionResponse(ephemeral("販売者のPayPayが未登録です。"));
+  }
+  const info:any=await checkPayPayLink(link);
+  if(!info) return interactionResponse(ephemeral("送金リンクを確認できませんでした。"));
+  const amount=Number(info?.payload?.message?.data?.amount??0);
+  if(!Number.isSafeInteger(amount)||amount<product.price_yen){
+    return interactionResponse(ephemeral(`金額が不足しています。必要: ${product.price_yen}円 / リンク: ${amount}円`));
+  }
+  if(info?.payload?.pendingP2PInfo?.isSetPasscode){
+    return interactionResponse(ephemeral("パスコード付きのリンクは使用できません。"));
+  }
+  if(String(info?.payload?.orderStatus??"")!=="PENDING"){
+    return interactionResponse(ephemeral("このリンクは既に受け取り・辞退・キャンセルされています。新しい送金リンクを入力してください。"));
+  }
+
+  const paymentId=randomId();
+  try{
+    await env.DB.prepare(
+      "INSERT INTO vending_used_payment_links(link_hash,provider,order_id,used_at) VALUES (?, 'shop', ?, ?)"
+    ).bind(await sha256Hex(link),paymentId,Date.now()).run();
+  }catch{
+    return interactionResponse(ephemeral("この送金リンクは既に使用されています。"));
+  }
+  const payment:PaymentRow={
+    id:paymentId,
+    merchant_payment_id:`dsm_${Date.now()}_${randomToken(6).replace(/[^a-zA-Z0-9_-]/g,"")}`,
+    guild_id:interaction.guild_id,
+    user_id:interaction.member.user.id,
+    product_id:product.id,
+    status:"CREATED",
+    paypay_url:await encrypt(env.SESSION_ENCRYPTION_KEY,link),
+    amount_yen:product.price_yen,
+    created_at:Date.now(),
+    updated_at:Date.now(),
+    delivered_at:null
+  };
+  await createPayment(env,payment);
+  const outcome=await confirmAndDeliver(env,payment).catch(error=>{
+    console.error("shop payment failed",paymentId,error);
+    return "ERROR";
+  });
+  const row=await env.DB.prepare("SELECT status,delivered_at FROM payments WHERE id=?")
+    .bind(paymentId).first<{status:string;delivered_at:number|null}>();
+  if(row?.delivered_at) return interactionResponse(ephemeral("決済と納品が完了しました。"));
+  if(row?.status==="COMPLETED"){
+    return interactionResponse(ephemeral("決済は完了しましたがDM納品に失敗しました。DMを開放してください。1分ごとに自動で再送します。"));
+  }
+  if(outcome==="LOGIN_REQUIRED"){
+    return interactionResponse(ephemeral("販売者のPayPayログインが切れています。販売者が再ログインすると自動で受け取ります。"));
+  }
+  if(row?.status==="FAILED"){
+    return interactionResponse(ephemeral("PayPay決済を確認できませんでした。別の有効な送金リンクを入力してください。"));
+  }
+  return interactionResponse(ephemeral("PayPay受け取りが保留されています。受け取り保留を解除してください。1分ごとに自動確認し、受け取れ次第納品します。"));
+}
+
+async function createTicketFromInteraction(env:Env,interaction:any):Promise<Response>{
+  const guildId=String(interaction.guild_id??"");
+  const userId=String(interaction.member?.user?.id??"");
+  if(!/^\d+$/.test(guildId)||!/^\d+$/.test(userId)){
+    throw new HttpError(400,"チケット作成に必要なDiscordサーバー/ユーザー情報を取得できませんでした。");
+  }
+  const username=String(interaction.member?.user?.username??"")||userId.slice(-6);
+  const channels=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+  const topic=`dsm-ticket:${userId}`;
+  const existing=channels.find(c=>c.type===0&&c.topic===topic);
+  if(existing) return interactionResponse(ephemeral(`既にチケットがあります: <#${existing.id}>`));
+  const [roles,settings]=await Promise.all([
+    botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`),
+    getGuildSettings(env,guildId)
+  ]);
+  const configuredIds=settings.ticketSupportRoleIds??[];
+  const supportRoles=configuredIds.length
+    ?roles.filter(role=>configuredIds.includes(role.id))
+    :roles.filter(role=>role.name==="Support").slice(0,1);
+  const safe=username.toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,18)||userId.slice(-6);
+  const overwrites:Array<Record<string,unknown>>=[
+    {id:guildId,type:0,deny:"1024"},
+    {id:userId,type:1,allow:(1024n|2048n|65536n|32768n).toString()},
+    {id:env.DISCORD_APPLICATION_ID.trim(),type:1,allow:BOT_CHANNEL_GUARD_MASK.toString()}
+  ];
+  for(const role of supportRoles){
+    overwrites.push({
+      id:role.id,
+      type:0,
+      allow:(1024n|2048n|65536n|32768n).toString()
+    });
+  }
+  const channel=await botJson<DiscordChannel>(env,`/guilds/${guildId}/channels`,{
+    method:"POST",
+    headers:{"X-Audit-Log-Reason":"Discord Main Bot: ticket created"},
+    body:JSON.stringify({
+      name:`ticket-${safe}`,
+      type:0,
+      topic,
+      permission_overwrites:overwrites
+    })
+  });
+  await sendMessage(env,channel.id,{
+    content:`<@${userId}> サポート担当者が対応します。${supportRoles.length?" 対応者ロール: "+supportRoles.map(role=>"@"+role.name).join(" / "):""}`,
+    components:[{
+      type:1,
+      components:[{type:2,custom_id:"ticket:close",label:"チケットを閉じる",style:4}]
+    }]
+  });
+  return interactionResponse(ephemeral(`作成しました: <#${channel.id}>`));
+}
+
+async function processInteraction(
+  interaction:any,
+  request:Request,
+  env:Env,
+  ctx:ExecutionContext
+):Promise<Response>{
+  // ── Amazon自販機 (CC-server) ──────────────────────────────────────────────
+  {
+    const type=interaction.type as number;
+    const customId=interactionCustomId(interaction);
+
+    // Amazon自販機 button: av:buy:<guildId>
+    if (type === 3 && customId.startsWith("av:buy:")) {
+      return handleAvBuyButton(interaction, env);
     }
 
-    return interactionResponse(ephemeral("未対応のアクションです。"));
+    // Amazon自販機 modal: av:url_modal:<guildId>
+    if (type === 5 && customId.startsWith("av:url_modal:")) {
+      return handleAvUrlModal(interaction, env, ctx);
+    }
+
+    // Amazon自販機 select: av:select:<sessionId>
+    if (type === 3 && customId.startsWith("av:select:")) {
+      return handleAvSelect(interaction);
+    }
+
+    // Amazon自販機 next button: av:next:<sessionId>
+    if (type === 3 && customId.startsWith("av:next:")) {
+      return handleAvNext(interaction);
+    }
+
+    // Amazon自販機 address modal: av:addr_modal:<sessionId>[:<variantAsin>:<priceJpy>]
+    if (type === 5 && customId.startsWith("av:addr_modal:")) {
+      return handleAvAddrModal(interaction, env, ctx);
+    }
+  }
+
+  if(isMediationInteraction(interaction)){
+    return handleMediationInteraction(interaction,env);
+  }
+
+  if(isVendingInteraction(interaction)){
+    const vendingResponse=await handleVendingInteraction(interaction,env,ctx);
+    if(vendingResponse) return vendingResponse;
+  }
+
+  if(interaction.type===5&&interactionCustomId(interaction).startsWith("buyl:")){
+    return submitShopLink(interaction,env);
+  }
+
+  if(interaction.type===2){
+    const name=interaction.data?.name;
+    if(name==="dashboard") return interactionResponse(ephemeral(`管理画面: ${env.WEB_PUBLIC_URL}`));
+    if(name==="security-status"&&interaction.guild_id){
+      await ensureSchema(env);
+      const s=await getGuildSettings(env,interaction.guild_id);
+      return interactionResponse(ephemeral(
+        `Security: ${s.securityEnabled?"ON":"OFF"}\nAutoMod Spam: ${s.antiSpam?"ON":"OFF"}\nAnti-Nuke: ${s.antiNuke?"ON":"OFF"}`
+      ));
+    }
+    return interactionResponse(ephemeral("このコマンドは管理画面から操作してください。"));
+  }
+
+  if(interaction.type===3){
+    const id=interaction.data?.custom_id as string;
+    if(id?.startsWith("verify:start:")){
+      await ensureSchema(env);
+      const guildId=id.split(":")[2]!;
+      const userId=String(interaction.member?.user?.id??"");
+      const settings=await getGuildSettings(env,guildId);
+      if(!settings.verifiedRoleId){
+        return interactionResponse(ephemeral("認証ロールが設定されていません。"));
+      }
+      const minAccountAgeDays=Math.max(
+        0,
+        Math.min(36500,Math.trunc(Number(settings.minAccountAgeDays)||0))
+      );
+      if(Date.now()-accountCreatedAt(userId)<minAccountAgeDays*86400000){
+        return interactionResponse(ephemeral(
+          `作成から${minAccountAgeDays}日未満のアカウントは認証できません。`
+        ));
+      }
+      const verificationUrl=await createVerificationRecoveryAuthorizeUrl(
+        env,new URL(request.url).origin,guildId,userId
+      );
+      return interactionResponse(ephemeral(
+        "下のボタンからDiscord認証を完了してください。認証ロール付与と復旧用メンバー登録が同時に行われます。",
+        [{
+          type:1,
+          components:[{
+            type:2,style:5,label:"Discordで認証",url:verificationUrl
+          }]
+        }]
+      ));
+    }
+    if(id==="ticket:create"){
+      await ensureSchema(env);
+      // Ticket creation is a non-destructive Main Bot channel_create action.
+      // Discord-Security already exempts protected service bots from that class,
+      // so ticket availability must not depend on the Security bridge being online.
+      return createTicketFromInteraction(env,interaction);
+    }
+    if(id==="ticket:close"){
+      const guildId=String(interaction.guild_id??"");
+      if(guildId) await requireMainSecurityLease(env,guildId,"dashboard_edit",30);
+      const channelId=interaction.channel_id as string;
+      ctx.waitUntil(botFetch(env,`/channels/${channelId}`,{
+        method:"DELETE",
+        headers:{"X-Audit-Log-Reason":"Discord Main Bot: ticket closed"}
+      }).then(()=>undefined));
+      return interactionResponse(ephemeral("チケットを閉じます。"));
+    }
+    if(id?.startsWith("buy:")){
+      await ensureSchema(env);
+      const product=await getProduct(env,id.slice(4));
+      if(!product||!product.active||product.guild_id!==interaction.guild_id){
+        return interactionResponse(ephemeral("この商品は現在購入できません。"));
+      }
+      return interactionResponse({
+        type:9,
+        data:{
+          custom_id:`buyl:${product.id}`,
+          title:"PayPay送金リンク",
+          components:[{type:1,components:[{
+            type:4,custom_id:"link",style:1,required:true,min_length:20,max_length:200,
+            label:`${product.price_yen}円以上のPayPay送金リンク`,
+            placeholder:"https://pay.paypay.ne.jp/..."
+          }]}]
+        }
+      });
+    }
   }
 
   return interactionResponse(ephemeral("未対応の操作です。"));
 }
 
-async function handleInteraction(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const body = await request.text();
-  if (!await verifyInteraction(env, request, body)) {
-    return new Response("invalid signature", { status: 401 });
+async function handleInteraction(
+  request:Request,env:Env,ctx:ExecutionContext
+):Promise<Response>{
+  const startedAt=Date.now();
+  const text=await request.text();
+  if(!(await verifyInteraction(env,request,text))){
+    return new Response("invalid signature",{status:401});
   }
-  const interaction = JSON.parse(body);
-  await ensureSchema(env);
-  return processInteraction(interaction, env, ctx);
+
+  const interaction=JSON.parse(text) as any;
+  if(interaction.type===1) return interactionResponse({type:1});
+
+  if(shouldDeferInteraction(interaction)){
+    const cfRay=request.headers.get("CF-Ray")??"";
+    console.log("interaction deferred",{
+      interactionId:String(interaction?.id??""),
+      type:interaction?.type,
+      customId:interactionCustomId(interaction),
+      ackPreparationMs:Date.now()-startedAt,
+      cfRay
+    });
+
+    ctx.waitUntil(
+      processInteraction(interaction,request,env,ctx)
+        .then(result=>finishDeferredInteraction(interaction,result))
+        .catch(error=>failDeferredInteraction(interaction,error))
+    );
+    // 確認メッセージのボタンは、その確認メッセージを結果へ書き換える（新しいメッセージを増やさない）
+    if(mediationDefersAsUpdate(interaction)) return interactionResponse({type:6});
+    return deferredEphemeral();
+  }
+
+  return processInteraction(interaction,request,env,ctx);
 }
 
-// ── admin API ─────────────────────────────────────────────────────────────────
+function commandDefinitions(){
+  return [
+    {name:"dashboard",description:"管理ダッシュボードを開きます",type:1},
+    {name:"security-status",description:"セキュリティ設定を表示します",type:1},
+    ...MEDIATION_COMMANDS
+  ];
+}
 
-async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionContext): Promise<Response> {
-  const path = url.pathname;
-  const method = request.method;
+async function registerCommands(env:Env):Promise<void>{
+  await botJson(env,`/applications/${env.DISCORD_APPLICATION_ID}/commands`,{
+    method:"PUT",
+    body:JSON.stringify(commandDefinitions())
+  });
+}
 
-  // login — no auth required
-  if (path === "/api/login" && method === "POST") {
-    if (!env.DASHBOARD_PASSWORD) throw new HttpError(503, "管理画面パスワードが未設定です");
-    const { password } = await request.json() as { password?: string };
-    if (!password) throw new HttpError(400, "パスワードを入力してください");
-    const [actual, expected] = await Promise.all([sha256Hex(password), sha256Hex(env.DASHBOARD_PASSWORD)]);
-    if (actual !== expected) throw new HttpError(401, "パスワードが違います");
-    const raw = randomToken(32);
-    await ensureSchema(env);
-    await createDashboardSession(env, await sha256Hex(raw), Date.now() + 30 * 24 * 60 * 60_000);
-    return json({ token: raw }, { env });
+/** コマンドの定義が変わったら、デプロイ後の最初の Cron で Discord に登録し直す（手作業の再登録を不要にする） */
+async function syncCommandsIfChanged(env:Env):Promise<void>{
+  const digest=await sha256Hex(JSON.stringify(commandDefinitions()));
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS worker_flags (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+  ).run();
+  const row=await env.DB.prepare("SELECT value FROM worker_flags WHERE key='commands_digest'").first<{value:string}>();
+  if(row?.value===digest) return;
+  await registerCommands(env);
+  await env.DB.prepare(
+    "INSERT INTO worker_flags(key,value,updated_at) VALUES ('commands_digest',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at"
+  ).bind(digest,Date.now()).run();
+}
+
+async function handleDashboardLogin(request:Request,env:Env):Promise<Response>{
+  if(!env.DASHBOARD_PASSWORD) throw new HttpError(503,"管理画面パスワードが未設定です");
+  const input=await bodyObject<{password?:string}>(request);
+  const password=String(input.password??"");
+  if(!password) throw new HttpError(400,"パスワードを入力してください");
+  const [actual,expected]=await Promise.all([
+    sha256Hex(password),
+    sha256Hex(env.DASHBOARD_PASSWORD)
+  ]);
+  if(actual!==expected) throw new HttpError(401,"パスワードが違います");
+  const rawSession=randomToken(32);
+  const expiresAt=Date.now()+30*24*60*60_000;
+  try{
+    await createDashboardSession(env,await sha256Hex(rawSession),expiresAt);
+  }catch(error){
+    console.error("dashboard session creation failed",error);
+    throw new HttpError(500,"管理セッションの保存に失敗しました");
   }
+  return json(env,{token:rawSession,expiresAt});
+}
 
-  // all other routes require auth
-  await sessionFromRequest(request, env);
-  await ensureSchema(env);
+type DashboardGuild = { id:string; name:string; icon:string|null };
 
-  // GET /api/status
-  if (path === "/api/status" && method === "GET") {
-    let discordReady = false;
-    let discordError: string | null = null;
-    let guildCount: number | null = null;
-    try {
-      await botJson(env, "/users/@me");
-      discordReady = true;
-      const guilds = await botJson<unknown[]>(env, "/users/@me/guilds");
-      guildCount = guilds.length;
-    } catch (err) {
-      discordError = err instanceof Error ? err.message : String(err);
-    }
-    return json({
-      discordReady,
-      discordError,
-      guildCount,
-      runtime: "cloudflare-workers",
-      inviteUrl: `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_APPLICATION_ID}&permissions=${BOT_PERMISSIONS}&integration_type=0&scope=bot%20applications.commands`,
-    }, { env });
-  }
+async function recoverKnownBotGuilds(
+  env:Env,
+  candidateIds:string[]
+):Promise<{guilds:DashboardGuild[];transientFailure:boolean}>{
+  const ids=[...new Set(candidateIds.filter(id=>/^\d+$/.test(id)))].slice(0,50);
+  const guilds:DashboardGuild[]=[];
+  let transientFailure=false;
 
-  // GET /api/guilds
-  if (path === "/api/guilds" && method === "GET") {
-    try {
-      const guilds = await botJson<Array<{ id: string; name: string; icon: string | null }>>(env, `/users/@me/guilds`);
-      await replaceBotGuildCache(env, guilds).catch(err => console.error("bot guild cache update failed", err));
-      return json(guilds, { env });
-    } catch (err) {
-      // Discord's aggregate guild-list endpoint can lag transiently right
-      // after an invite; fall back to the last known-good snapshot instead
-      // of showing an empty sidebar.
-      const cached = await listBotGuildCache(env).catch(() => []);
-      if (cached.length > 0) {
-        console.warn("bot guild list: live call failed, serving cache", err);
-        return json(cached, { env });
-      }
-      throw err;
-    }
-  }
-
-  // GET /api/backups
-  if (path === "/api/backups" && method === "GET") {
-    return json(await listBackups(env), { env });
-  }
-
-  // DELETE /api/backups/:id
-  const backupItemMatch = path.match(/^\/api\/backups\/([^/]+)$/);
-  if (backupItemMatch && method === "DELETE") {
-    await deleteBackup(env, backupItemMatch[1]!);
-    return json({ ok: true }, { env });
-  }
-
-  // POST /api/backups/:id/restore/preview
-  const previewMatch = path.match(/^\/api\/backups\/([^/]+)\/restore\/preview$/);
-  if (previewMatch && method === "POST") {
-    const { target_guild_id } = await request.json() as { target_guild_id?: string };
-    if (!target_guild_id) throw new HttpError(400, "target_guild_id required");
-    return json(await previewRestore(env, previewMatch[1]!, target_guild_id), { env });
-  }
-
-  // POST /api/backups/:id/restore
-  const restoreMatch = path.match(/^\/api\/backups\/([^/]+)\/restore$/);
-  if (restoreMatch && method === "POST") {
-    const { target_guild_id } = await request.json() as { target_guild_id?: string };
-    if (!target_guild_id) throw new HttpError(400, "target_guild_id required");
-    const job = await startRestore(env, restoreMatch[1]!, target_guild_id, ctx);
-    return json(job, { env });
-  }
-
-  // GET /api/restore-jobs?target_guild_id=...
-  if (path === "/api/restore-jobs" && method === "GET") {
-    const targetGuildId = url.searchParams.get("target_guild_id");
-    if (!targetGuildId) throw new HttpError(400, "target_guild_id required");
-    return json(await listRestoreJobs(env, targetGuildId), { env });
-  }
-
-  // GET /api/restore-jobs/:id
-  const jobMatch = path.match(/^\/api\/restore-jobs\/([^/]+)$/);
-  if (jobMatch && method === "GET") {
-    return json(await getRestoreJobPublic(env, jobMatch[1]!), { env });
-  }
-
-  // DELETE /api/restore-jobs/:id — cancel a running restore job
-  if (jobMatch && method === "DELETE") {
-    const cancelled = await cancelRestore(env, jobMatch[1]!);
-    if (!cancelled) throw new HttpError(409, "このジョブは既に完了または停止しています");
-    return json({ ok: true }, { env });
-  }
-
-  // /api/guilds/:guildId/...
-  const guildMatch = path.match(/^\/api\/guilds\/(\d+)(\/.*)?$/);
-  if (!guildMatch) throw new HttpError(404, "not found");
-  const guildId = guildMatch[1]!;
-  const sub = guildMatch[2] ?? "/";
-
-  // GET /api/guilds/:id/meta
-  if (sub === "/meta" && method === "GET") {
-    const [channels, roles] = await Promise.all([
-      botJson<DiscordChannel[]>(env, `/guilds/${guildId}/channels`),
-      botJson<DiscordRole[]>(env, `/guilds/${guildId}/roles`),
-    ]);
-    const guild = await botJson<{ id: string; name: string; icon: string | null }>(env, `/guilds/${guildId}`);
-    return json({
-      id: guild.id,
-      name: guild.name,
-      icon: guild.icon,
-      channels: channels
-        .filter(c => [0, 5].includes(c.type))
-        .map(c => ({ id: c.id, name: c.name, type: c.type, parent_id: c.parent_id ?? null })),
-      roles: roles
-        .filter(r => !r.managed && r.id !== guildId)
-        .map(r => ({ id: r.id, name: r.name, color: r.color })),
-    }, { env });
-  }
-
-  // GET/PUT /api/guilds/:id/config
-  if (sub === "/config") {
-    if (method === "GET") return json(await getGuildConfig(env, guildId), { env });
-    if (method === "PUT") {
-      const body = await request.json() as Record<string, unknown>;
-      const ALLOWED = new Set([
-        "admin_role_id", "mod_role_id", "log_channel_id", "verified_role_id", "verify_channel_id",
-        "welcome_channel_id", "welcome_message", "leave_channel_id", "leave_message",
-        "ticket_category_id", "ticket_log_channel_id",
-        "anti_spam_enabled", "anti_spam_threshold", "anti_spam_window_ms",
-        "anti_link_enabled", "anti_link_whitelist",
-        "raid_protection_enabled", "raid_join_threshold", "raid_window_ms", "raid_action",
-      ]);
-      const fields: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(body)) if (ALLOWED.has(k)) fields[k] = v;
-      await updateGuildConfig(env, guildId, fields);
-      return json({ ok: true }, { env });
-    }
-  }
-
-  // GET /api/guilds/:id/server-editor — channels (all types) + roles (incl. @everyone)
-  if (sub === "/server-editor" && method === "GET") {
-    return json(await getServerEditorData(env, guildId), { env });
-  }
-
-  // POST /api/guilds/:id/backups
-  if (sub === "/backups" && method === "POST") {
-    const { label } = await request.json().catch(() => ({})) as { label?: string };
-    const guildConfig = await getGuildConfig(env, guildId);
-    return json(await createBackup(env, guildId, label ?? null, guildConfig), { env });
-  }
-
-  // POST /api/guilds/:id/channels
-  if (sub === "/channels" && method === "POST") {
-    const body = await request.json() as Parameters<typeof createChannel>[2];
-    return json(await createChannel(env, guildId, body), { status: 201, env });
-  }
-
-  // PATCH /api/guilds/:id/channels/reorder
-  if (sub === "/channels/reorder" && method === "PATCH") {
-    const body = await request.json() as Parameters<typeof reorderChannel>[2];
-    return json(await reorderChannel(env, guildId, body), { env });
-  }
-
-  // PATCH /api/guilds/:id/channels/permissions/bulk
-  if (sub === "/channels/permissions/bulk" && method === "PATCH") {
-    const body = await request.json() as Parameters<typeof bulkChannelPermissions>[2];
-    return json(await bulkChannelPermissions(env, guildId, body), { env });
-  }
-
-  // PATCH /api/guilds/:id/channels/:channelId
-  const channelMatch = sub.match(/^\/channels\/(\d+)$/);
-  if (channelMatch && method === "PATCH") {
-    const [, channelId] = channelMatch as [string, string];
-    const body = await request.json() as { name?: string; parentId?: string | null; topic?: string };
-    return json(await patchChannel(env, guildId, channelId, body), { env });
-  }
-
-  // PATCH /api/guilds/:id/channels/:channelId/permissions/:targetId
-  const channelPermMatch = sub.match(/^\/channels\/(\d+)\/permissions\/(\d+)$/);
-  if (channelPermMatch && method === "PATCH") {
-    const [, channelId, targetId] = channelPermMatch as [string, string, string];
-    const body = await request.json() as { permissions?: Record<string, string> };
-    return json(await patchChannelPermission(env, guildId, channelId, targetId, body.permissions ?? {}), { env });
-  }
-
-  // POST /api/guilds/:id/roles
-  if (sub === "/roles" && method === "POST") {
-    const body = await request.json() as Parameters<typeof createRole>[2];
-    return json(await createRole(env, guildId, body), { status: 201, env });
-  }
-
-  // PATCH/DELETE /api/guilds/:id/roles/:roleId
-  const roleItemMatch = sub.match(/^\/roles\/(\d+)$/);
-  if (roleItemMatch) {
-    const roleId = roleItemMatch[1]!;
-    if (method === "PATCH") {
-      const body = await request.json() as Parameters<typeof patchRole>[3];
-      return json(await patchRole(env, guildId, roleId, body), { env });
-    }
-    if (method === "DELETE") {
-      await deleteRole(env, guildId, roleId);
-      return json({ ok: true }, { env });
-    }
-  }
-
-  // GET/POST /api/guilds/:id/external-auths
-  if (sub === "/external-auths") {
-    if (method === "GET") return json(await listExternalAuths(env, guildId), { env });
-    if (method === "POST") {
-      const input = await request.json() as { name?: string; url?: string };
-      const name = String(input.name ?? "").trim();
-      const rawUrl = String(input.url ?? "").trim();
-      if (!name || name.length > 80) throw new HttpError(400, "名前を入力してください（80文字以内）");
-      if (!/^https:\/\/discord\.com\/oauth2\/authorize\?/.test(rawUrl)) {
-        throw new HttpError(400, "Discord OAuthのURLを入力してください（https://discord.com/oauth2/authorize?...）");
-      }
-      const id = randomToken(16);
-      await insertExternalAuth(env, { id, guild_id: guildId, name, url: rawUrl, created_at: Date.now() });
-      return json({ ok: true, id }, { status: 201, env });
-    }
-  }
-
-  // DELETE /api/guilds/:id/external-auths/:id
-  const externalAuthItemMatch = sub.match(/^\/external-auths\/([^/]+)$/);
-  if (externalAuthItemMatch && method === "DELETE") {
-    if (!(await deleteExternalAuth(env, externalAuthItemMatch[1]!, guildId))) {
-      throw new HttpError(404, "見つかりません");
-    }
-    return json({ ok: true }, { env });
-  }
-
-  // GET /api/guilds/:id/security-center
-  if (sub === "/security-center" && method === "GET") {
-    ctx.waitUntil(ensureSecurityGatewayRunning(env).catch(err => console.error("security gateway start failed", err)));
-    return json(await getSecurityOverview(env, guildId), { env });
-  }
-
-  // PUT /api/guilds/:id/security-center/settings
-  if (sub === "/security-center/settings" && method === "PUT") {
-    const body = await request.json();
-    return json(await updateSecuritySettings(env, guildId, body), { env });
-  }
-
-  // POST /api/guilds/:id/security-center/lockdown
-  if (sub === "/security-center/lockdown" && method === "POST") {
-    const body = await request.json().catch(() => ({})) as { minutes?: number };
-    return json(await triggerLockdown(env, guildId, body.minutes), { env });
-  }
-
-  // DELETE /api/guilds/:id/security-center/lockdown
-  if (sub === "/security-center/lockdown" && method === "DELETE") {
-    const result = await releaseLockdown(env, guildId);
-    if ("error" in result) return json(result, { status: 409, env });
-    return json(result, { env });
-  }
-
-  // GET/PUT /api/guilds/:id/member-activity
-  if (sub === "/member-activity") {
-    if (method === "GET") return json(await getMemberActivitySettings(env, guildId), { env });
-    if (method === "PUT") {
-      const input = await request.json() as { enabled?: boolean; channelId?: string | null; joinEnabled?: boolean; leaveEnabled?: boolean };
-      if (typeof input.enabled !== "boolean" || typeof input.joinEnabled !== "boolean" || typeof input.leaveEnabled !== "boolean") {
-        throw new HttpError(400, "入退室設定が不正です");
-      }
-      const channelId = input.channelId ? String(input.channelId) : null;
-      if (input.enabled && !channelId) throw new HttpError(400, "通知先チャンネルを選択してください");
-      let saved = await saveMemberActivitySettings(env, guildId, {
-        enabled: input.enabled, channelId, joinEnabled: input.joinEnabled, leaveEnabled: input.leaveEnabled,
-      });
-      if (saved.enabled) {
-        try {
-          saved = await primeMemberActivity(env, guildId);
-        } catch (err) {
-          if (err instanceof DiscordApiError && err.status === 403) {
-            throw new HttpError(409, "メンバー一覧を取得できません。Discord Developer Portal の Bot 設定で Server Members Intent を有効にしてから、もう一度保存してください");
-          }
-          throw err;
+  for(let offset=0;offset<ids.length;offset+=5){
+    const batch=ids.slice(offset,offset+5);
+    const results=await Promise.all(batch.map(async id=>{
+      try{
+        return await botJson<DashboardGuild>(env,`/guilds/${id}`);
+      }catch(error){
+        if(
+          error instanceof DiscordApiError&&
+          [401,403,404].includes(error.status)
+        ){
+          return null;
         }
+        transientFailure=true;
+        return null;
       }
-      try {
-        await ensureSecurityGatewayRunning(env);
-      } catch (err) {
-        console.error("security gateway start failed", err);
-        if (saved.enabled) throw new HttpError(502, "設定は保存されましたが、リアルタイム入退室検知の起動に失敗しました。少し待ってからもう一度保存してください");
-      }
-      return json(saved, { env });
+    }));
+    for(const guild of results){
+      if(guild) guilds.push(guild);
     }
   }
 
-  // POST /api/guilds/:id/member-activity/test
-  if (sub === "/member-activity/test" && method === "POST") {
-    const { channelId } = await request.json() as { channelId?: string };
-    if (!channelId) throw new HttpError(400, "通知先チャンネルを選択してください");
-    await sendMemberActivityTest(env, guildId, channelId);
-    return json({ ok: true }, { env });
-  }
+  return {guilds,transientFailure};
+}
 
-  // GET /api/guilds/:id/panels
-  if (sub === "/panels" && method === "GET") return json(await listPanels(env, guildId), { env });
-
-  // POST /api/guilds/:id/panels
-  if (sub === "/panels" && method === "POST") {
-    const body = await request.json() as { title?: string; description?: string };
-    const title = String(body.title ?? "").trim();
-    if (!title) throw new HttpError(400, "title is required");
-    const id = await createPanel(env, guildId, title, body.description ? String(body.description).trim() : null);
-    return json({ id }, { env });
-  }
-
-  // Panel sub-routes
-  const panelMatch = sub.match(/^\/panels\/(\d+)(\/.*)?$/);
-  if (panelMatch) {
-    const panelId = parseInt(panelMatch[1]!, 10);
-    const panelSub = panelMatch[2] ?? "/";
-    const panel = await getPanel(env, panelId, guildId);
-    if (!panel) throw new HttpError(404, "パネルが見つかりません");
-
-    // GET /panels/:id/buttons
-    if (panelSub === "/buttons" && method === "GET") return json(await listPanelButtons(env, panelId), { env });
-
-    // POST /panels/:id/buttons
-    if (panelSub === "/buttons" && method === "POST") {
-      const body = await request.json() as any;
-      const label = String(body.label ?? "").trim();
-      const style = ["Primary", "Secondary", "Success", "Danger"].includes(body.style) ? body.style : "Primary";
-      const emoji = body.emoji ? String(body.emoji).trim() : null;
-      const actionType = ["toggle_role", "show_text"].includes(body.action_type) ? body.action_type : null;
-      const actionValue = String(body.action_value ?? "").trim();
-      if (!label || !actionType || !actionValue) throw new HttpError(400, "label, action_type, action_value required");
-      await createPanelButton(env, panelId, label, style, emoji, actionType, actionValue);
-      return json({ ok: true }, { env });
-    }
-
-    // DELETE /panels/:id/buttons/:btnId
-    const btnMatch = panelSub.match(/^\/buttons\/(\d+)$/);
-    if (btnMatch && method === "DELETE") {
-      await deletePanelButton(env, parseInt(btnMatch[1]!, 10), panelId);
-      return json({ ok: true }, { env });
-    }
-
-    // POST /panels/:id/post
-    if (panelSub === "/post" && method === "POST") {
-      const { channel_id } = await request.json() as { channel_id?: string };
-      if (!channel_id) throw new HttpError(400, "channel_id required");
-      const buttons = await listPanelButtons(env, panelId);
-      const components = [];
-      for (let i = 0; i < buttons.length; i += 5) {
-        components.push({
-          type: 1,
-          components: buttons.slice(i, i + 5).map(b => ({
-            type: 2,
-            custom_id: `panel:${b.id}`,
-            label: b.label,
-            style: STYLE_MAP[b.style] ?? 1,
-            ...(b.emoji ? { emoji: { name: b.emoji } } : {}),
-          })),
+async function securityRecoveryGuilds(
+  env:Env,
+  candidateIds:string[]
+):Promise<Array<DashboardGuild & {botInstalled:false}>>{
+  if(!securityBridgeConfigured(env)) return [];
+  const result:Array<DashboardGuild & {botInstalled:false}>=[];
+  for(const id of [...new Set(candidateIds)].slice(0,20)){
+    if(!/^\d+$/.test(id)) continue;
+    try{
+      const overview=await securityBridgeJson<any>(
+        env,
+        `/internal/guilds/${id}/overview?limit=1`
+      );
+      if(overview?.installed){
+        result.push({
+          id,
+          name:"Security Bot導入済みサーバー",
+          icon:null,
+          botInstalled:false
         });
       }
-      const embed: any = { title: panel.title, color: 0x9b59b6 };
-      if (panel.description) embed.description = panel.description;
-      const msg = await botJson<{ id: string }>(env, `/channels/${channel_id}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ embeds: [embed], components }),
-      });
-      await updatePanelPost(env, panelId, msg.id, channel_id);
-      return json({ ok: true }, { env });
+    }catch{
+      // Recovery hint is best-effort; never block normal guild loading.
     }
+  }
+  return result;
+}
 
-    throw new HttpError(404, "not found");
+async function handleApi(request:Request,env:Env,url:URL):Promise<Response>{
+  if(url.pathname==="/api/status"&&request.method==="GET"){
+    let discordReady=false;
+    let discordUser:string|null=null;
+    let discordError:string|null=null;
+    try{
+      const bot=await botJson<{id:string;username:string}>(env,"/users/@me");
+      discordReady=true;
+      discordUser=bot.username;
+    }catch(error){
+      discordError=error instanceof Error?error.message:String(error);
+    }
+    return json(env,{
+      discordReady,
+      discordUser,
+      discordError,
+      guildCount:null,
+      dashboardPasswordConfigured:Boolean(env.DASHBOARD_PASSWORD),
+      payPayConfigured:Boolean(await getPayPay(env,SHOP_PAYPAY_OWNER,env.SESSION_ENCRYPTION_KEY).catch(()=>null)),
+      payPayEnvironment:"web-session",
+      runtime:"cloudflare-workers",
+      inviteUrl:
+        `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_APPLICATION_ID}`+
+        `&permissions=${BOT_PERMISSIONS}&integration_type=0&scope=bot%20applications.commands`
+    });
   }
 
+  if(url.pathname==="/api/me"&&request.method==="GET"){
+    const s=await sessionFromRequest(request,env);
+    return json(env,{id:s.user_id,username:s.username,avatar:s.avatar});
+  }
+
+  const securityCenter=url.pathname.match(/^\/api\/guilds\/(\d+)\/security-center$/);
+  if(securityCenter){
+    const guildId=securityCenter[1]!;
+    await requireGuild(request,env,guildId);
+    if(request.method==="GET"){
+      if(!securityBridgeConfigured(env)){
+        return json(env,{
+          configured:false,
+          settings:null,
+          status:{connected:false,lastHeartbeatAck:null,lastEventAt:null,reconnectAttempts:0,botUserId:null},
+          incidents:[],
+          lockdown:{active:false,expiresAt:null,reason:null}
+        });
+      }
+      try{
+        await securityBridgeJson(
+          env,
+          `/internal/guilds/${guildId}/service-bots`,
+          {
+            method:"POST",
+            body:JSON.stringify({botId:env.DISCORD_APPLICATION_ID,kind:"main"})
+          }
+        );
+        return json(env,await securityBridgeJson(
+          env,
+          `/internal/guilds/${guildId}/overview?limit=30`
+        ));
+      }catch(error){
+        console.error("security center overview failed",error);
+        // This endpoint feeds a dedicated dashboard state. Returning a
+        // successful envelope lets the UI render "Security Bot unreachable"
+        // instead of the shared API client converting the response into a
+        // generic exception before SecurityManager can inspect it.
+        return json(env,{
+          configured:true,
+          unreachable:true,
+          message:error instanceof Error?error.message:String(error),
+          settings:null,
+          status:{connected:false,lastHeartbeatAck:null,lastEventAt:null,reconnectAttempts:0,botUserId:null},
+          incidents:[],
+          lockdown:{active:false,expiresAt:null,reason:null}
+        });
+      }
+    }
+    if(request.method==="PUT"){
+      if(!securityBridgeConfigured(env)) throw new HttpError(503,"Security Botがまだ接続されていません");
+      const body=await request.text();
+      const saved=await securityBridgeJson(
+        env,
+        `/internal/guilds/${guildId}/settings`,
+        {method:"PUT",body}
+      );
+      return json(env,saved);
+    }
+  }
+
+  const securityLockdown=url.pathname.match(/^\/api\/guilds\/(\d+)\/security-lockdown$/);
+  if(securityLockdown){
+    const guildId=securityLockdown[1]!;
+    await requireGuild(request,env,guildId);
+    if(!securityBridgeConfigured(env)) throw new HttpError(503,"Security Botがまだ接続されていません");
+    if(request.method==="POST"){
+      const body=await request.text();
+      return json(env,await securityBridgeJson(
+        env,
+        `/internal/guilds/${guildId}/lockdown`,
+        {method:"POST",body:body||JSON.stringify({reason:"manual dashboard lockdown"})}
+      ));
+    }
+    if(request.method==="DELETE"){
+      return json(env,await securityBridgeJson(
+        env,
+        `/internal/guilds/${guildId}/lockdown`,
+        {method:"DELETE"}
+      ));
+    }
+  }
+
+
+  if(url.pathname==="/api/logout"&&request.method==="POST"){
+    const auth=request.headers.get("Authorization");
+    if(auth?.startsWith("Bearer ")) await deleteDashboardSession(env,await sha256Hex(auth.slice(7).trim()));
+    return json(env,{ok:true});
+  }
+
+  if(url.pathname==="/api/commands/register"&&request.method==="POST"){
+    await sessionFromRequest(request,env);
+    await registerCommands(env);
+    return json(env,{ok:true});
+  }
+
+  if(url.pathname==="/api/guilds"&&request.method==="GET"){
+    await sessionFromRequest(request,env);
+
+    const [cached,knownIds]=await Promise.all([
+      listBotGuildCache(env,24*60*60_000).catch(()=>[]),
+      listKnownGuildIds(env).catch(()=>[])
+    ]);
+
+    // Prefer the IDs learned from Gateway READY/GUILD_CREATE and persisted
+    // subsystems. A direct GET /guilds/:id is the strongest membership check and
+    // avoids depending on the aggregate current-user guild-list endpoint.
+    if(knownIds.length){
+      const recovered=await recoverKnownBotGuilds(env,knownIds);
+      if(recovered.guilds.length){
+        await Promise.all([
+          replaceBotGuildCache(env,recovered.guilds).catch(error=>
+            console.error("bot guild cache update failed",error)
+          ),
+          replaceBotGuildMembership(
+            env,
+            recovered.guilds.map(guild=>guild.id)
+          ).catch(error=>
+            console.error("bot guild membership update failed",error)
+          )
+        ]);
+        return json(env,recovered.guilds.map(guild=>({
+          ...guild,
+          botInstalled:true
+        })));
+      }
+
+      if(recovered.transientFailure&&cached.length){
+        console.warn(
+          "bot guild list: direct probes transient; serving recent cache",
+          cached.length
+        );
+        return json(env,cached.map(guild=>({
+          id:guild.id,
+          name:guild.name,
+          icon:guild.icon,
+          botInstalled:true
+        })));
+      }
+    }
+
+    // Bootstrap/fallback for installs that have not yet received a fresh READY.
+    try{
+      const live=await botJson<DashboardGuild[]>(
+        env,"/users/@me/guilds?limit=200"
+      );
+
+      if(live.length>0){
+        await Promise.all([
+          replaceBotGuildCache(env,live).catch(error=>
+            console.error("bot guild cache update failed",error)
+          ),
+          replaceBotGuildMembership(
+            env,
+            live.map(guild=>guild.id)
+          ).catch(error=>
+            console.error("bot guild membership update failed",error)
+          )
+        ]);
+        return json(env,live.map(guild=>({
+          ...guild,
+          botInstalled:true
+        })));
+      }
+
+      if(cached.length){
+        console.warn(
+          "bot guild list: aggregate endpoint empty; serving recent cache",
+          cached.length
+        );
+        return json(env,cached.map(guild=>({
+          id:guild.id,
+          name:guild.name,
+          icon:guild.icon,
+          botInstalled:true
+        })));
+      }
+
+      const recoveryGuilds=await securityRecoveryGuilds(env,knownIds);
+      if(recoveryGuilds.length){
+        return json(env,recoveryGuilds);
+      }
+
+      return json(env,[]);
+    }catch(error){
+      console.error("bot guild list failed",error);
+      const recoverable=
+        !(error instanceof DiscordApiError)||
+        [429,500,502,503,504].includes(error.status);
+      if(recoverable&&cached.length){
+        console.warn("bot guild list: serving recent cache",cached.length);
+        return json(env,cached.map(guild=>({
+          id:guild.id,
+          name:guild.name,
+          icon:guild.icon,
+          botInstalled:true
+        })));
+      }
+      if(recoverable){
+        const recoveryGuilds=await securityRecoveryGuilds(env,knownIds);
+        if(recoveryGuilds.length) return json(env,recoveryGuilds);
+      }
+      const detail=error instanceof Error?error.message:"unknown";
+      throw new HttpError(502,"BOT参加サーバー一覧の取得に失敗しました: "+detail.slice(0,160));
+    }
+  }
+
+  const repairMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/bot-access\/repair$/);
+  if(repairMatch&&request.method==="POST"){
+    const guildId=repairMatch[1]!;
+    await requireGuild(request,env,guildId);
+    return json(env,await repairBotChannelAccess(env,guildId));
+  }
+
+  const meta=url.pathname.match(/^\/api\/guilds\/(\d+)\/meta$/);
+  if(meta&&request.method==="GET"){
+    const guildId=meta[1]!;
+    await sessionFromRequest(request,env);
+
+    // This endpoint is intentionally read-only. Previous code repaired channel
+    // overwrites while merely opening the dashboard, which generated dozens of
+    // audit-log entries and could trip Discord-Security's anti-nuke rules.
+    const [guild,metaData]=await Promise.all([
+      botJson<{id:string;name:string;icon:string|null}>(env,`/guilds/${guildId}`),
+      discordMeta(env,guildId)
+    ]);
+    return json(env,{
+      ...guild,
+      ...metaData
+    });
+  }
+
+  const memberActivityMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/member-activity$/);
+  if(memberActivityMatch){
+    const guildId=memberActivityMatch[1]!;
+    if(request.method==="GET"){
+      await sessionFromRequest(request,env);
+      return json(env,await getMemberActivitySettings(env,guildId));
+    }
+    await requireGuild(request,env,guildId);
+    if(request.method==="PUT"){
+      const input=await bodyObject<{
+        enabled?:boolean;
+        channelId?:string|null;
+        joinEnabled?:boolean;
+        leaveEnabled?:boolean;
+      }>(request);
+      if(typeof input.enabled!=="boolean"||
+        typeof input.joinEnabled!=="boolean"||
+        typeof input.leaveEnabled!=="boolean"){
+        throw new HttpError(400,"入退室設定が不正です");
+      }
+      const channelId=input.channelId?String(input.channelId):null;
+      if(input.enabled&&!channelId){
+        throw new HttpError(400,"通知先チャンネルを選択してください");
+      }
+      if(channelId) await requireMessageChannel(env,guildId,channelId);
+      let saved=await saveMemberActivitySettings(env,guildId,{
+        enabled:input.enabled,
+        channelId,
+        joinEnabled:input.joinEnabled,
+        leaveEnabled:input.leaveEnabled
+      });
+      if(saved.enabled){
+        try{
+          saved=await primeMemberActivity(env,guildId);
+        }catch(error){
+          if(error instanceof DiscordApiError&&error.status===403){
+            throw new HttpError(
+              409,
+              "メンバー一覧を取得できません。Discord Developer Portal の Bot 設定で Server Members Intent を有効にしてから、もう一度保存してください"
+            );
+          }
+          throw error;
+        }
+      }
+      // 入退室は1分ごとの Cron でメンバー一覧を見比べて通知する（Main Bot の常時 Gateway 接続は廃止）
+      return json(env,saved);
+    }
+  }
+
+  const memberActivityTest=url.pathname.match(/^\/api\/guilds\/(\d+)\/member-activity\/test$/);
+  if(memberActivityTest&&request.method==="POST"){
+    const guildId=memberActivityTest[1]!;
+    await requireGuild(request,env,guildId);
+    const {channelId}=await bodyObject<{channelId?:string}>(request);
+    if(!channelId) throw new HttpError(400,"通知先チャンネルを選択してください");
+    await requireMessageChannel(env,guildId,channelId);
+    await sendMemberActivityTest(env,guildId,channelId);
+    return json(env,{ok:true});
+  }
+
+  const settingsMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/settings$/);
+  if(settingsMatch){
+    const guildId=settingsMatch[1]!;
+    if(request.method==="GET"){
+      await sessionFromRequest(request,env);
+      return json(env,await getGuildSettings(env,guildId));
+    }
+    await requireGuild(request,env,guildId);
+    if(request.method==="PUT"){
+      const patch=await bodyObject<Partial<GuildSettings>>(request);
+      const safe:Partial<GuildSettings>={};
+      for(const key of ["securityEnabled","antiSpam","blockInvites","antiRaid","antiNuke"] as const){
+        if(patch[key]===undefined) continue;
+        if(typeof patch[key]!=="boolean") throw new HttpError(400,key+" はオン/オフで指定してください");
+        safe[key]=patch[key];
+      }
+      const limits={spamMax:[2,50],spamWindowSeconds:[1,300],mentionLimit:[2,50],
+        raidJoins:[2,1000],raidWindowSeconds:[1,300],nukeActions:[2,30],
+        nukeWindowSeconds:[5,300],minAccountAgeDays:[0,36500]} as const;
+      for(const key of Object.keys(limits) as Array<keyof typeof limits>){
+        if(patch[key]===undefined) continue;
+        const value=patch[key];
+        const [min,max]=limits[key];
+        if(typeof value!=="number"||!Number.isInteger(value)||value<min||value>max){
+          throw new HttpError(400,key+" は "+min+"〜"+max+" の整数で指定してください");
+        }
+        safe[key]=value;
+      }
+      for(const key of ["verifiedRoleId","logChannelId"] as const){
+        if(patch[key]===undefined) continue;
+        const value=patch[key];
+        if(value!==null&&(typeof value!=="string"||!/^\d+$/.test(value.trim()))){
+          throw new HttpError(400,key+" が不正です");
+        }
+        safe[key]=value?.trim()??null;
+      }
+      for(const key of ["ticketSupportRoleIds","trustedUserIds","trustedRoleIds"] as const){
+        const value=patch[key];
+        if(value===undefined) continue;
+        if(!Array.isArray(value)||value.some(id=>typeof id!=="string"||!/^\d+$/.test(id.trim()))){
+          throw new HttpError(400,key+" は有効なIDの配列で指定してください");
+        }
+        if(value.length>100||(key==="ticketSupportRoleIds"&&value.length>20)){
+          throw new HttpError(400,key+" の件数が上限を超えています");
+        }
+        safe[key]=[...new Set(value.map(id=>id.trim()))];
+      }
+
+      if(safe.verifiedRoleId){
+        const roles=await botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`);
+        const targetRole=roles.find(role=>role.id===safe.verifiedRoleId);
+        if(!targetRole||targetRole.id===guildId){
+          throw new HttpError(400,"認証後ロールには@everyone以外の有効なロールを選択してください");
+        }
+        if(targetRole.managed){
+          throw new HttpError(400,"Discord管理ロールは認証後ロールに指定できません");
+        }
+        if((BigInt(targetRole.permissions||"0")&DANGEROUS_PERMISSION_MASK)!==0n){
+          throw new HttpError(
+            400,
+            "認証後ロールに管理者・ロール管理・チャンネル管理・BAN/Kickなどの危険権限は設定できません"
+          );
+        }
+        // Do not reject the setting based only on Discord's role position values.
+        // Discord is authoritative when the role is actually assigned, and equal
+        // numeric positions can still have a valid hierarchy order.
+      }
+
+      const saved=await saveGuildSettings(env,guildId,safe);
+      const persisted=await getGuildSettings(env,guildId);
+      if(
+        safe.minAccountAgeDays!==undefined&&
+        persisted.minAccountAgeDays!==safe.minAccountAgeDays
+      ){
+        throw new HttpError(500,"最低アカウント日数の保存確認に失敗しました");
+      }
+      if(
+        safe.verifiedRoleId!==undefined&&
+        persisted.verifiedRoleId!==safe.verifiedRoleId
+      ){
+        throw new HttpError(500,"認証ロールの保存確認に失敗しました");
+      }
+      const applyWarnings=await syncAutoMod(env,guildId,persisted);
+      return json(env,{...persisted,applyWarnings});
+    }
+  }
+
+  const channelsMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/channels$/);
+  if(channelsMatch&&request.method==="POST"){
+    const guildId=channelsMatch[1]!;
+    await requireGuild(request,env,guildId);
+    const input=await bodyObject<{
+      name:string;
+      type:"text"|"voice"|"category"|"thread";
+      parentId?:string|null;
+      topic?:string;
+      privateThread?:boolean;
+      autoArchiveMinutes?:number;
+      message?:string;
+    }>(request);
+    const name=input.name?.trim();
+    if(!name||name.length>100) throw new HttpError(400,"チャンネル名が不正です");
+    if(input.type==="thread"){
+      // スレッドは親チャンネルの下に作る。フォーラム/メディアは最初の投稿が必須
+      const parentChannelId=String(input.parentId??"");
+      if(!/^\d+$/.test(parentChannelId)) throw new HttpError(400,"スレッドを作るチャンネルを選んでください");
+      const parent=await botJson<DiscordChannel>(env,`/channels/${parentChannelId}`);
+      if((parent.guild_id??guildId)!==guildId) throw new HttpError(400,"スレッドを作るチャンネルが不正です");
+      const autoArchive=[60,1440,4320,10080].includes(Number(input.autoArchiveMinutes))
+        ?Number(input.autoArchiveMinutes)
+        :1440;
+      let threadBody:Record<string,unknown>;
+      if(parent.type===15||parent.type===16){
+        const message=String(input.message??"").trim();
+        if(!message) throw new HttpError(400,"フォーラムのスレッドには最初の投稿内容が必要です");
+        threadBody={name,auto_archive_duration:autoArchive,message:{content:message.slice(0,2000)}};
+      }else if(parent.type===0||parent.type===5){
+        if(parent.type===5&&input.privateThread){
+          throw new HttpError(400,"アナウンスチャンネルにはプライベートスレッドを作れません");
+        }
+        threadBody={
+          name,
+          auto_archive_duration:autoArchive,
+          type:parent.type===5?10:input.privateThread?12:11,
+          ...(input.privateThread?{invitable:false}:{})
+        };
+      }else{
+        throw new HttpError(400,"このチャンネルにはスレッドを作れません（テキスト・アナウンス・フォーラムのみ）");
+      }
+      const thread=await botJson<DiscordChannel>(env,`/channels/${parentChannelId}/threads`,{
+        method:"POST",
+        headers:{"X-Audit-Log-Reason":"Dashboard: thread created"},
+        body:JSON.stringify(threadBody)
+      });
+      return json(env,{id:thread.id,name:thread.name,type:"thread",parentId:parentChannelId});
+    }
+    const botOverwrite=[{
+      id:env.DISCORD_APPLICATION_ID.trim(),
+      type:1,
+      allow:BOT_CHANNEL_GUARD_MASK.toString()
+    }];
+    const created=await botJson<DiscordChannel>(env,`/guilds/${guildId}/channels`,{
+      method:"POST",
+      body:JSON.stringify(
+        input.type==="category"
+          ?{name,type:4,permission_overwrites:botOverwrite}
+          :input.type==="voice"
+            ?{
+                name,
+                type:2,
+                parent_id:input.parentId||undefined,
+                ...(input.parentId?{}:{permission_overwrites:botOverwrite})
+              }
+            :{
+                name,
+                type:0,
+                parent_id:input.parentId||undefined,
+                topic:input.topic||undefined,
+                ...(input.parentId?{}:{permission_overwrites:botOverwrite})
+              }
+      )
+    });
+    return json(env,{id:created.id,name:created.name,type:input.type});
+  }
+
+  const channelReorderMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/channels\/reorder$/);
+  if(channelReorderMatch&&request.method==="PATCH"){
+    const guildId=channelReorderMatch[1]!;
+    await requireGuild(request,env,guildId);
+    const input=await bodyObject<{
+      id:string;
+      targetId?:string|null;
+      placement?:"before"|"after"|"start";
+      parentId?:string|null;
+      position?:number;
+    }>(request);
+
+    if(!/^\d+$/.test(input.id??"")) throw new HttpError(400,"並び替え対象が不正です");
+
+    const channels=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+    const source=channels.find(channel=>channel.id===input.id);
+    if(!source) throw new HttpError(404,"移動するチャンネルが見つかりません");
+
+    if(source.type===4){
+      const byOrder=(a:DiscordChannel,b:DiscordChannel)=>
+        (a.position??0)-(b.position??0)||(BigInt(a.id)<BigInt(b.id)?-1:1);
+      const categories=channels.filter(channel=>channel.type===4).sort(byOrder);
+      const others=categories.filter(channel=>channel.id!==source.id);
+      let index:number;
+      if(input.targetId){
+        if(input.targetId===source.id) return json(env,{ok:true,kind:"category",unchanged:true});
+        const targetIndex=others.findIndex(channel=>channel.id===input.targetId);
+        if(targetIndex<0) throw new HttpError(400,"移動先カテゴリが見つかりません");
+        index=targetIndex+(input.placement==="after"?1:0);
+      }else if(Number.isInteger(input.position)){
+        // 旧クライアント互換: 指定位置のカテゴリの場所へ入れる
+        const at=others.findIndex(channel=>(channel.position??0)>=Number(input.position));
+        index=at<0?others.length:at;
+      }else{
+        throw new HttpError(400,"カテゴリの並び替え位置が不正です");
+      }
+      const reordered=[...others];
+      reordered.splice(Math.max(0,Math.min(index,others.length)),0,source);
+      // 1つだけ position を変えると他のカテゴリと値が重なって順番が確定しないので、全カテゴリの順番を送る
+      await botJson(env,`/guilds/${guildId}/channels`,{
+        method:"PATCH",
+        headers:{"X-Audit-Log-Reason":"Dashboard: category reorder"},
+        body:JSON.stringify(reordered.map((channel,position)=>({id:channel.id,position})))
+      });
+      const confirmed=(await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`))
+        .filter(channel=>channel.type===4)
+        .sort(byOrder)
+        .map(channel=>channel.id);
+      if(confirmed.join(",")!==reordered.map(channel=>channel.id).join(",")){
+        throw new HttpError(502,"Discord側でカテゴリの並び替えを反映できませんでした");
+      }
+      return json(env,{ok:true,kind:"category"});
+    }
+
+    let destinationParent: string|null;
+    let destinationIndex=0;
+    let destinationSiblings:DiscordChannel[];
+
+    if(input.targetId){
+      const target=channels.find(channel=>channel.id===input.targetId);
+      if(!target||target.type===4) throw new HttpError(400,"移動先チャンネルが不正です");
+      if(target.id===source.id) return json(env,{ok:true,unchanged:true});
+
+      destinationParent=target.parent_id??null;
+      destinationSiblings=channels
+        .filter(channel=>channel.type!==4&&channel.id!==source.id&&(channel.parent_id??null)===destinationParent)
+        .sort((a,b)=>(a.position??0)-(b.position??0));
+
+      const targetIndex=destinationSiblings.findIndex(channel=>channel.id===target.id);
+      if(targetIndex<0) throw new HttpError(400,"移動先を判定できませんでした");
+      destinationIndex=targetIndex+(input.placement==="after"?1:0);
+    }else{
+      destinationParent=input.parentId??null;
+      if(destinationParent!==null){
+        const category=channels.find(channel=>channel.id===destinationParent&&channel.type===4);
+        if(!category) throw new HttpError(400,"移動先カテゴリが見つかりません");
+      }
+      destinationSiblings=channels
+        .filter(channel=>channel.type!==4&&channel.id!==source.id&&(channel.parent_id??null)===destinationParent)
+        .sort((a,b)=>(a.position??0)-(b.position??0));
+      destinationIndex=input.placement==="start"?0:destinationSiblings.length;
+    }
+
+    destinationIndex=Math.max(0,Math.min(destinationIndex,destinationSiblings.length));
+    const reordered=[...destinationSiblings];
+    reordered.splice(destinationIndex,0,source);
+
+    // Send the full destination sibling order instead of only one position.
+    // Discord then has an unambiguous order even when moving across categories.
+    const payload=reordered.map((channel,index)=>({
+      id:channel.id,
+      position:index,
+      ...(channel.id===source.id
+        ?{parent_id:destinationParent,lock_permissions:false}
+        :{})
+    }));
+
+    await botJson(env,`/guilds/${guildId}/channels`,{
+      method:"PATCH",
+      body:JSON.stringify(payload)
+    });
+
+    // Read back from Discord and verify the move really stuck before reporting success.
+    const confirmed=await botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`);
+    const confirmedSource=confirmed.find(channel=>channel.id===source.id);
+    if(!confirmedSource||(confirmedSource.parent_id??null)!==destinationParent){
+      throw new HttpError(502,"Discord側でカテゴリ移動を反映できませんでした");
+    }
+
+    const confirmedSiblings=confirmed
+      .filter(channel=>channel.type!==4&&(channel.parent_id??null)===destinationParent)
+      .sort((a,b)=>(a.position??0)-(b.position??0));
+    const actualIndex=confirmedSiblings.findIndex(channel=>channel.id===source.id);
+    const expectedPrevious=reordered[destinationIndex-1]?.id??null;
+    const expectedNext=reordered[destinationIndex+1]?.id??null;
+    const actualPrevious=actualIndex>0?confirmedSiblings[actualIndex-1]?.id??null:null;
+    const actualNext=actualIndex>=0?confirmedSiblings[actualIndex+1]?.id??null:null;
+
+    const orderMatches=
+      actualIndex>=0&&
+      (expectedPrevious===null||actualPrevious===expectedPrevious)&&
+      (expectedNext===null||actualNext===expectedNext);
+
+    if(!orderMatches){
+      // One retry with a fresh canonical position list handles Discord's occasional
+      // position normalization after a parent change.
+      const retrySiblings=confirmedSiblings.filter(channel=>channel.id!==source.id);
+      const retryIndex=Math.max(0,Math.min(destinationIndex,retrySiblings.length));
+      retrySiblings.splice(retryIndex,0,confirmedSource);
+      await botJson(env,`/guilds/${guildId}/channels`,{
+        method:"PATCH",
+        body:JSON.stringify(retrySiblings.map((channel,index)=>({
+          id:channel.id,
+          position:index,
+          ...(channel.id===source.id
+            ?{parent_id:destinationParent,lock_permissions:false}
+            :{})
+        })))
+      });
+    }
+
+    return json(env,{
+      ok:true,
+      id:source.id,
+      parentId:destinationParent,
+      targetId:input.targetId??null,
+      placement:input.targetId?(input.placement==="after"?"after":"before"):"start"
+    });
+  }
+
+  const rolesCollectionMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/roles$/);
+  if(rolesCollectionMatch&&request.method==="POST"){
+    const guildId=rolesCollectionMatch[1]!;
+    await requireGuild(request,env,guildId);
+    const input=await bodyObject<{
+      name?:string;
+      color?:number;
+      permissions?:string;
+    }>(request);
+
+    const name=String(input.name??"").trim();
+    if(!name||name.length>100) throw new HttpError(400,"ロール名が不正です");
+
+    const color=input.color===undefined?0:Number(input.color);
+    if(!Number.isInteger(color)||color<0||color>0xFFFFFF){
+      throw new HttpError(400,"ロール色が不正です");
+    }
+
+    let permissions="0";
+    try{
+      const parsed=BigInt(input.permissions??"0");
+      if(parsed<0n) throw new Error();
+      permissions=parsed.toString();
+    }catch{
+      throw new HttpError(400,"ロール権限が不正です");
+    }
+
+    try{
+      const role=await botJson<DiscordRole>(env,`/guilds/${guildId}/roles`,{
+        method:"POST",
+        body:JSON.stringify({name,color,permissions})
+      });
+      return json(env,{
+        id:role.id,
+        name:role.name,
+        position:role.position,
+        color:role.color??0,
+        permissions:role.permissions,
+        isEveryone:false
+      },201);
+    }catch(error){
+      if(error instanceof DiscordApiError&&error.status===403){
+        throw new HttpError(
+          403,
+          "ロールを追加できません。BOTに「ロールの管理」権限があるか確認してください"
+        );
+      }
+      throw error;
+    }
+  }
+
+  const roleItemMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/roles\/(\d+)$/);
+  if(roleItemMatch){
+    const guildId=roleItemMatch[1]!;
+    const roleId=roleItemMatch[2]!;
+    await requireGuild(request,env,guildId);
+
+    if(request.method==="PATCH"){
+      const input=await bodyObject<{
+        name?:string;
+        color?:number;
+        permissions?:string;
+      }>(request);
+
+      const payload:Record<string,unknown>={};
+      if(input.permissions!==undefined){
+        try{
+          const parsed=BigInt(input.permissions);
+          if(parsed<0n) throw new Error();
+          payload.permissions=parsed.toString();
+        }catch{
+          throw new HttpError(400,"ロール権限が不正です");
+        }
+      }
+
+      if(roleId===guildId){
+        if(input.name!==undefined||input.color!==undefined){
+          throw new HttpError(400,"@everyone は名前や色を変更できません");
+        }
+      }else{
+        if(input.name!==undefined){
+          const name=String(input.name).trim();
+          if(!name||name.length>100) throw new HttpError(400,"ロール名が不正です");
+          payload.name=name;
+        }
+        if(input.color!==undefined){
+          const color=Number(input.color);
+          if(!Number.isInteger(color)||color<0||color>0xFFFFFF){
+            throw new HttpError(400,"ロール色が不正です");
+          }
+          payload.color=color;
+        }
+      }
+
+      try{
+        const role=await botJson<DiscordRole>(env,`/guilds/${guildId}/roles/${roleId}`,{
+          method:"PATCH",
+          body:JSON.stringify(payload)
+        });
+        return json(env,{
+          id:role.id,
+          name:role.name,
+          position:role.position,
+          color:role.color??0,
+          permissions:role.permissions,
+          isEveryone:role.id===guildId
+        });
+      }catch(error){
+        if(error instanceof DiscordApiError&&error.status===403){
+          throw new HttpError(
+            403,
+            "このロールを編集できません。BOTの「ロールの管理」権限、またはBOTより上にあるロールの並び順を確認してください"
+          );
+        }
+        throw error;
+      }
+    }
+
+    if(request.method==="DELETE"){
+      if(roleId===guildId) throw new HttpError(400,"@everyone は削除できません");
+      try{
+        await botJson<void>(env,`/guilds/${guildId}/roles/${roleId}`,{
+          method:"DELETE"
+        });
+        return json(env,{ok:true});
+      }catch(error){
+        if(error instanceof DiscordApiError&&error.status===403){
+          throw new HttpError(
+            403,
+            "このロールを削除できません。BOTの「ロールの管理」権限、またはBOTより上にあるロールの並び順を確認してください"
+          );
+        }
+        throw error;
+      }
+    }
+  }
+
+  const bulkChannelPermissionMatch=url.pathname.match(
+    /^\/api\/guilds\/(\d+)\/channels\/permissions\/bulk$/
+  );
+  if(bulkChannelPermissionMatch&&request.method==="PATCH"){
+    const guildId=bulkChannelPermissionMatch[1]!;
+    await requireGuild(request,env,guildId);
+    const input=await bodyObject<{
+      channelIds?:string[];
+      targetId?:string;
+      permissions?:ChannelPermissionPatch;
+    }>(request);
+
+    const channelIds=[...new Set(
+      (input.channelIds??[])
+        .map(id=>String(id).trim())
+        .filter(id=>/^\d+$/.test(id))
+    )];
+    const targetId=String(input.targetId??"").trim();
+    const permissions=input.permissions??{};
+    if(channelIds.length===0) throw new HttpError(400,"対象チャンネルを選択してください");
+    if(channelIds.length>100) throw new HttpError(400,"一度に変更できるのは100チャンネルまでです");
+    if(!/^\d+$/.test(targetId)) throw new HttpError(400,"対象ロールが不正です");
+    if(Object.keys(permissions).length===0){
+      throw new HttpError(400,"変更する権限を選択してください");
+    }
+
+    const [channels,roles]=await Promise.all([
+      botJson<DiscordChannel[]>(env,`/guilds/${guildId}/channels`),
+      botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`)
+    ]);
+    if(targetId!==guildId&&!roles.some(role=>role.id===targetId)){
+      throw new HttpError(404,"対象ロールが見つかりません");
+    }
+    const member=await getBotGuildMember(env,guildId,roles);
+    const channelById=new Map(channels.map(channel=>[channel.id,channel]));
+    const updated:string[]=[];
+    const failed:Array<{id:string;name:string;message:string}>=[];
+
+    for(const channelId of channelIds){
+      const channel=channelById.get(channelId);
+      if(!channel||channel.type===4){
+        failed.push({
+          id:channelId,
+          name:channel?.name??channelId,
+          message:"チャンネルが見つかりません"
+        });
+        continue;
+      }
+      try{
+        await applyChannelRolePermissions(
+          env,
+          guildId,
+          channel,
+          targetId,
+          roles,
+          member,
+          permissions
+        );
+        updated.push(channelId);
+      }catch(error){
+        failed.push({
+          id:channel.id,
+          name:channel.name,
+          message:error instanceof Error?error.message:String(error)
+        });
+      }
+    }
+
+    const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
+    const verify=async(ids:string[])=>{
+      let remaining=[...ids];
+      let confirmedById=new Map<string,DiscordChannel>();
+      for(const delay of [0,180,420]){
+        if(delay>0) await sleep(delay);
+        const confirmed=await botJson<DiscordChannel[]>(
+          env,
+          `/guilds/${guildId}/channels`
+        );
+        confirmedById=new Map(confirmed.map(channel=>[channel.id,channel]));
+        remaining=remaining.filter(channelId=>{
+          const channel=confirmedById.get(channelId);
+          return !channel||!channelPermissionPatchMatches(channel,targetId,permissions);
+        });
+        if(remaining.length===0) break;
+      }
+      return {remaining,confirmedById};
+    };
+
+    let verification=await verify(updated);
+    if(verification.remaining.length>0){
+      // Retry only the channels whose overwrite was not visible after the first
+      // write. This handles transient Discord propagation without duplicating
+      // successful writes across the whole selection.
+      for(const channelId of verification.remaining){
+        const channel=channelById.get(channelId);
+        if(!channel) continue;
+        try{
+          await applyChannelRolePermissions(
+            env,
+            guildId,
+            channel,
+            targetId,
+            roles,
+            member,
+            permissions
+          );
+        }catch(error){
+          failed.push({
+            id:channel.id,
+            name:channel.name,
+            message:"再試行に失敗: "+(error instanceof Error?error.message:String(error))
+          });
+        }
+      }
+      verification=await verify(
+        verification.remaining.filter(
+          id=>!failed.some(failure=>failure.id===id)
+        )
+      );
+    }
+
+    for(const channelId of verification.remaining){
+      const original=channelById.get(channelId);
+      failed.push({
+        id:channelId,
+        name:original?.name??channelId,
+        message:"Discordから再取得した権限が指定内容と一致しませんでした"
+      });
+    }
+
+    const failedIds=new Set(failed.map(item=>item.id));
+    const updatedIds=updated.filter(id=>!failedIds.has(id));
+    const operationId=randomId();
+
+    console.log("bulk channel permissions",{
+      operationId,
+      guildId,
+      targetId,
+      requested:channelIds.length,
+      updated:updatedIds.length,
+      failed:failed.length
+    });
+
+    return json(env,{
+      ok:failed.length===0,
+      operationId,
+      targetId,
+      requested:channelIds.length,
+      updated:updatedIds.length,
+      updatedIds,
+      failed
+    });
+  }
+
+  const channelPermissionMatch=url.pathname.match(
+    /^\/api\/guilds\/(\d+)\/channels\/(\d+)\/permissions\/(\d+)$/
+  );
+  if(channelPermissionMatch&&request.method==="PATCH"){
+    const guildId=channelPermissionMatch[1]!;
+    const channelId=channelPermissionMatch[2]!;
+    const targetId=channelPermissionMatch[3]!;
+
+    // Every dashboard permission write must obtain a Security maintenance lease.
+    // This route previously authenticated the dashboard session only, so the
+    // independent Security Bot could misclassify legitimate Main Bot overwrite
+    // updates as hostile activity.
+    await requireGuild(request,env,guildId);
+
+    const input=await bodyObject<{
+      targetType?:"role";
+      permissions?:ChannelPermissionPatch;
+    }>(request);
+    const permissions=input.permissions??{};
+    if(Object.keys(permissions).length===0){
+      throw new HttpError(400,"変更する権限を選択してください");
+    }
+
+    // Get Guild Channels is deliberately used instead of GET /channels/:id.
+    // It still lets the dashboard repair a channel the bot cannot directly view.
+    const channelsResponse=await botFetchInteractive(
+      env,
+      `/guilds/${guildId}/channels`
+    );
+    if(!channelsResponse.ok){
+      const detail=await channelsResponse.text().catch(()=>"");
+      if(channelsResponse.status===403){
+        throw new HttpError(
+          403,
+          "BOTがサーバーのチャンネル一覧を取得できません。BOTがサーバーに参加しているか確認してください"
+        );
+      }
+      throw new DiscordApiError(
+        channelsResponse.status,
+        "Discord API "+channelsResponse.status+": "+detail.slice(0,300)
+      );
+    }
+
+    const channels=await channelsResponse.json() as DiscordChannel[];
+    const channel=channels.find(item=>item.id===channelId);
+    if(!channel){
+      throw new HttpError(
+        404,
+        "対象チャンネルが見つかりません。サーバー構成を再読み込みしてください"
+      );
+    }
+
+    const currentTarget=(channel.permission_overwrites??[]).find(
+      item=>item.id===targetId&&item.type===0
+    );
+    let targetAllow=BigInt(currentTarget?.allow??"0");
+    let targetDeny=BigInt(currentTarget?.deny??"0");
+    const beforeAllow=targetAllow;
+    const beforeDeny=targetDeny;
+
+    for(const [rawKey,mode] of Object.entries(permissions)){
+      if(!(rawKey in CHANNEL_PERMISSION_BITS)) continue;
+      if(mode!=="inherit"&&mode!=="allow"&&mode!=="deny") continue;
+      const bit=CHANNEL_PERMISSION_BITS[rawKey as ChannelPermissionKey];
+      targetAllow&=~bit;
+      targetDeny&=~bit;
+      if(mode==="allow") targetAllow|=bit;
+      if(mode==="deny") targetDeny|=bit;
+    }
+
+    const botId=env.DISCORD_APPLICATION_ID.trim();
+    const shouldProtectBot=permissions.view==="deny";
+    const currentBot=(channel.permission_overwrites??[]).find(
+      item=>item.id===botId&&item.type===1
+    );
+    let botAllow=BigInt(currentBot?.allow??"0");
+    let botDeny=BigInt(currentBot?.deny??"0");
+    if(shouldProtectBot){
+      botAllow|=BOT_CHANNEL_GUARD_MASK;
+      botDeny&=~BOT_CHANNEL_GUARD_MASK;
+    }
+
+    // Replace the complete overwrite array atomically. This avoids the old
+    // multi-request sequence (guard PUT -> role PUT -> readback -> retry).
+    // Every unrelated overwrite is copied byte-for-byte.
+    const replacement=(channel.permission_overwrites??[])
+      .filter(item=>
+        !(item.id===targetId&&item.type===0)&&
+        !(shouldProtectBot&&item.id===botId&&item.type===1)
+      )
+      .map(item=>({
+        id:item.id,
+        type:item.type,
+        allow:item.allow,
+        deny:item.deny
+      }));
+
+    if(targetAllow!==0n||targetDeny!==0n){
+      replacement.push({
+        id:targetId,
+        type:0,
+        allow:targetAllow.toString(),
+        deny:targetDeny.toString()
+      });
+    }
+    if(shouldProtectBot){
+      replacement.push({
+        id:botId,
+        type:1,
+        allow:botAllow.toString(),
+        deny:botDeny.toString()
+      });
+    }
+
+    let writeResponse=await botFetchInteractive(
+      env,
+      `/channels/${channelId}`,
+      {
+        method:"PATCH",
+        body:JSON.stringify({permission_overwrites:replacement})
+      }
+    );
+
+    if(writeResponse.status===403){
+      // A prior Security incident or a private-channel overwrite can leave the
+      // Main Bot unable to repair itself. Ask the higher-privileged Security Bot
+      // to restore only the Main Bot's dashboard access bits, then retry this
+      // exact role permission change from fresh Discord state.
+      const recovered=await repairMainBotChannelAccessViaSecurity(
+        env,
+        guildId,
+        channelId
+      );
+      if(recovered){
+        const refreshedChannels=await botJson<DiscordChannel[]>(
+          env,
+          `/guilds/${guildId}/channels`
+        );
+        const refreshedChannel=refreshedChannels.find(item=>item.id===channelId);
+        if(!refreshedChannel){
+          throw new HttpError(
+            404,
+            "Security BotでBOTアクセスを復旧しましたが、対象チャンネルを再取得できませんでした"
+          );
+        }
+
+        const fallback=await applyChannelRolePermissionsFast(
+          env,
+          guildId,
+          refreshedChannel,
+          targetId,
+          permissions
+        );
+
+        const confirmedChannels=await botJson<DiscordChannel[]>(
+          env,
+          `/guilds/${guildId}/channels`
+        );
+        const confirmedChannel=confirmedChannels.find(item=>item.id===channelId);
+        if(
+          !confirmedChannel||
+          !channelPermissionPatchMatches(confirmedChannel,targetId,permissions)
+        ){
+          throw new HttpError(
+            502,
+            "BOTアクセスは復旧しましたが、Discordから再取得した権限が指定内容と一致しませんでした"
+          );
+        }
+
+        const persisted=(confirmedChannel.permission_overwrites??[]).find(
+          item=>item.id===targetId&&item.type===0
+        );
+        const operationId=randomId();
+        console.log("channel permissions recovered and verified",{
+          operationId,
+          guildId,
+          channelId,
+          targetId
+        });
+        return json(env,{
+          ok:true,
+          verified:true,
+          verification:"security-bot-repair-readback",
+          operationId,
+          channelId,
+          targetId,
+          allow:persisted?.allow??"0",
+          deny:persisted?.deny??"0",
+          changed:fallback.changed,
+          botAccessRecovered:true
+        });
+      }
+    }
+
+    if(!writeResponse.ok){
+      const detail=await writeResponse.text().catch(()=>"");
+      if(writeResponse.status===403){
+        throw new HttpError(
+          403,
+          "Discordがチャンネル権限の変更を拒否しました。Security Botによる自動復旧も完了できませんでした。BOTロールの「チャンネルの管理」「ロールの管理」、対象チャンネルへのアクセス、ロールの並び順を確認してください"
+        );
+      }
+      throw new DiscordApiError(
+        writeResponse.status,
+        "Discord API "+writeResponse.status+": "+detail.slice(0,300)
+      );
+    }
+
+    // Modify Channel returns the updated channel. Verify that exact response
+    // instead of making another Discord request.
+    const updated=await writeResponse.json() as DiscordChannel;
+    const persisted=(updated.permission_overwrites??[]).find(
+      item=>item.id===targetId&&item.type===0
+    );
+    const actualAllow=persisted?.allow??"0";
+    const actualDeny=persisted?.deny??"0";
+    if(
+      actualAllow!==targetAllow.toString()||
+      actualDeny!==targetDeny.toString()
+    ){
+      console.error("channel permission atomic verification mismatch",{
+        guildId,
+        channelId,
+        targetId,
+        expectedAllow:targetAllow.toString(),
+        expectedDeny:targetDeny.toString(),
+        actualAllow,
+        actualDeny
+      });
+      throw new HttpError(
+        502,
+        "Discordの更新レスポンスが指定した権限と一致しませんでした。成功扱いにはしていません"
+      );
+    }
+
+    if(shouldProtectBot){
+      const persistedBot=(updated.permission_overwrites??[]).find(
+        item=>item.id===botId&&item.type===1
+      );
+      const persistedBotAllow=BigInt(persistedBot?.allow??"0");
+      const persistedBotDeny=BigInt(persistedBot?.deny??"0");
+      if(
+        (persistedBotAllow&BOT_CHANNEL_GUARD_MASK)!==BOT_CHANNEL_GUARD_MASK||
+        (persistedBotDeny&BOT_CHANNEL_GUARD_MASK)!==0n
+      ){
+        throw new HttpError(
+          502,
+          "権限自体は更新されましたがBOT保護権限を確認できないため、成功扱いにはしていません"
+        );
+      }
+    }
+
+    const operationId=randomId();
+    console.log("channel permissions atomic verified",{
+      operationId,
+      guildId,
+      channelId,
+      targetId,
+      changed:targetAllow!==beforeAllow||targetDeny!==beforeDeny,
+      allow:targetAllow.toString(),
+      deny:targetDeny.toString()
+    });
+
+    return json(env,{
+      ok:true,
+      verified:true,
+      verification:"modify-channel-response",
+      operationId,
+      channelId,
+      targetId,
+      allow:targetAllow.toString(),
+      deny:targetDeny.toString(),
+      changed:targetAllow!==beforeAllow||targetDeny!==beforeDeny
+    });
+  }
+
+  const channelItemMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/channels\/(\d+)$/);
+  if(channelItemMatch){
+    const guildId=channelItemMatch[1]!;
+    const channelId=channelItemMatch[2]!;
+    await requireGuild(request,env,guildId);
+
+    if(request.method==="PATCH"){
+      const input=await bodyObject<{
+        name?:string;
+        topic?:string|null;
+        parentId?:string|null;
+      }>(request);
+      // Discordはチャンネル名・トピックの変更を1チャンネルにつき10分に2回までに制限している。
+      // 変わっていない項目まで送ると、カテゴリ移動だけでもこの枠を使ってしまうので、変わった項目だけ送る。
+      const current=await botJson<DiscordChannel>(env,`/channels/${channelId}`);
+      const payload:Record<string,unknown>={};
+      if(input.name!==undefined){
+        const name=input.name.trim();
+        if(!name||name.length>100) throw new HttpError(400,"チャンネル名が不正です");
+        if(name!==current.name) payload.name=name;
+      }
+      if(input.topic!==undefined){
+        const topic=input.topic===null?null:String(input.topic).slice(0,1024);
+        if((topic??"")!==(current.topic??"")) payload.topic=topic;
+      }
+      if(input.parentId!==undefined&&(input.parentId||null)!==(current.parent_id??null)){
+        payload.parent_id=input.parentId||null;
+      }
+      if(Object.keys(payload).length===0){
+        return json(env,{
+          id:current.id,
+          name:current.name,
+          parentId:current.parent_id??null,
+          topic:current.topic??"",
+          position:current.position??0,
+          unchanged:true
+        });
+      }
+      let updated:DiscordChannel;
+      try{
+        updated=await botJson<DiscordChannel>(env,`/channels/${channelId}`,{
+          method:"PATCH",
+          body:JSON.stringify(payload)
+        });
+      }catch(error){
+        if(error instanceof DiscordApiError&&error.status===429&&("name" in payload||"topic" in payload)){
+          const ms=error.retryAfterMs??0;
+          const wait=ms>=60_000?`約${Math.ceil(ms/60_000)}分`:ms>0?`約${Math.ceil(ms/1000)}秒`:"しばらく";
+          throw new HttpError(
+            429,
+            `Discordの制限で、チャンネル名・トピックの変更は1つのチャンネルにつき10分に2回までです。${wait}待ってから保存してください`
+          );
+        }
+        throw error;
+      }
+      return json(env,{
+        id:updated.id,
+        name:updated.name,
+        parentId:updated.parent_id??null,
+        topic:updated.topic??"",
+        position:updated.position??0
+      });
+    }
+
+    if(request.method==="DELETE"){
+      const response=await botFetch(env,`/channels/${channelId}`,{method:"DELETE"});
+      if(!response.ok) throw new HttpError(response.status,"チャンネルを削除できませんでした");
+      return json(env,{ok:true});
+    }
+  }
+
+  const templateMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/templates\/(community|shop|support)$/);
+  if(templateMatch&&request.method==="POST"){
+    await requireGuild(request,env,templateMatch[1]!);
+    await applyTemplate(env,templateMatch[1]!,templateMatch[2]!);
+    return json(env,{ok:true});
+  }
+
+  const verifyPanel=url.pathname.match(/^\/api\/guilds\/(\d+)\/verification\/panel$/);
+  if(verifyPanel&&request.method==="POST"){
+    const guildId=verifyPanel[1]!;
+    await requireGuild(request,env,guildId);
+    await ensureSchema(env);
+    const input=await bodyObject<{channelId?:string;verifiedRoleId?:string|null}>(request);
+    const verificationSettings=await getGuildSettings(env,guildId);
+    const requestedRoleId=
+      input.verifiedRoleId===undefined
+        ?verificationSettings.verifiedRoleId
+        :input.verifiedRoleId;
+    const verifiedRoleId=
+      typeof requestedRoleId==="string"?requestedRoleId.trim():requestedRoleId;
+    if(!verifiedRoleId){
+      throw new HttpError(409,"認証後ロールを選択してください");
+    }
+    if(!/^\d+$/.test(verifiedRoleId)){
+      throw new HttpError(400,"認証後ロールが不正です");
+    }
+    const roles=await botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`);
+    const targetRole=roles.find(role=>role.id===verifiedRoleId);
+    if(!targetRole||targetRole.id===guildId){
+      throw new HttpError(400,"認証後ロールには@everyone以外の有効なロールを選択してください");
+    }
+    if(targetRole.managed){
+      throw new HttpError(400,"Discord管理ロールは認証後ロールに指定できません");
+    }
+    if((BigInt(targetRole.permissions||"0")&DANGEROUS_PERMISSION_MASK)!==0n){
+      throw new HttpError(
+        400,
+        "認証後ロールに管理者・ロール管理・チャンネル管理・BAN/Kickなどの危険権限は設定できません"
+      );
+    }
+    if(verificationSettings.verifiedRoleId!==verifiedRoleId){
+      await saveGuildSettings(env,guildId,{verifiedRoleId});
+    }
+    const {channelId}=input;
+    if(!channelId) throw new HttpError(400,"設置先チャンネルを選択してください");
+    await requireMessageChannel(env,guildId,channelId);
+    try{
+      await publishVerificationPanel(env,guildId,channelId,new URL(request.url).origin);
+    }catch(error){
+      if(error instanceof DiscordApiError&&error.status===404){
+        throw new HttpError(404,"設置先チャンネルが見つかりません。チャンネル一覧を再読み込みしてください");
+      }
+      if(error instanceof DiscordApiError&&error.status===429){
+        throw new HttpError(429,"Discord APIのレート制限中です。少し待ってからもう一度設置してください");
+      }
+      throw error;
+    }
+    return json(env,{ok:true,channelId});
+  }
+
+  const ticketPanel=url.pathname.match(/^\/api\/guilds\/(\d+)\/tickets\/panel$/);
+  if(ticketPanel&&request.method==="POST"){
+    const guildId=ticketPanel[1]!;
+    await requireGuild(request,env,guildId);
+    const {channelId}=await bodyObject<{channelId?:string}>(request);
+    if(!channelId) throw new HttpError(400,"設置先チャンネルを選択してください");
+    await requireMessageChannel(env,guildId,channelId);
+    try{
+      await publishTicketPanel(env,guildId,channelId);
+    }catch(error){
+      if(error instanceof DiscordApiError&&error.status===404){
+        throw new HttpError(
+          404,
+          "設置先チャンネルが見つかりません。チャンネル一覧を再読み込みしてください"
+        );
+      }
+      if(error instanceof DiscordApiError&&error.status===429){
+        throw new HttpError(
+          429,
+          "Discord APIのレート制限中です。少し待ってからもう一度設置してください"
+        );
+      }
+      throw error;
+    }
+    return json(env,{ok:true,channelId});
+  }
+
+  // ── Amazon自販機 (CC-server) ──────────────────────────────────────────────
   // GET/PUT /api/guilds/:id/amazon-vending
-  if (sub === "/amazon-vending" || sub === "/amazon-vending/") {
-    if (method === "GET") return json(await getAvConfig(env, guildId), { env });
-    if (method === "PUT") {
+  const amazonVendingMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/amazon-vending\/?$/);
+  if(amazonVendingMatch){
+    const guildId=amazonVendingMatch[1]!;
+    await sessionFromRequest(request,env);
+    if (request.method === "GET") return json(env, await getAvConfig(env, guildId));
+    if (request.method === "PUT") {
       const body = await request.json() as any;
       const title = String(body.panel_title ?? "Amazon自販機").slice(0, 100);
       const desc = String(body.panel_description ?? "").slice(0, 500);
@@ -547,12 +3165,15 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
       const apiType = ["rainforest", "keepa", "canopy"].includes(body.api_type) ? body.api_type : "rainforest";
       const apiKey = String(body.api_key ?? "").trim();
       await upsertAvConfig(env, { guild_id: guildId, panel_title: title, panel_description: desc || null, ltc_address: ltc || null, api_type: apiType, api_key: apiKey || null });
-      return json({ ok: true }, { env });
+      return json(env, { ok: true });
     }
   }
 
   // POST /api/guilds/:id/amazon-vending/panel
-  if (sub === "/amazon-vending/panel" && method === "POST") {
+  const amazonVendingPanelMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/amazon-vending\/panel$/);
+  if(amazonVendingPanelMatch&&request.method==="POST"){
+    const guildId=amazonVendingPanelMatch[1]!;
+    await requireGuild(request,env,guildId);
     const { channel_id } = await request.json() as { channel_id?: string };
     if (!channel_id) throw new HttpError(400, "channel_id required");
     const cfg = await getAvConfig(env, guildId);
@@ -577,51 +3198,409 @@ async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionCon
         }],
       }),
     });
-    return json({ ok: true, message_id: msg.id }, { env });
+    return json(env, { ok: true, message_id: msg.id });
   }
 
-  throw new HttpError(404, "not found");
+  const productsMatch=url.pathname.match(/^\/api\/guilds\/(\d+)\/products$/);
+  if(productsMatch){
+    const guildId=productsMatch[1]!;
+    if(request.method==="GET"){
+      await sessionFromRequest(request,env);
+      return json(env,await listProducts(env,guildId));
+    }
+    await requireGuild(request,env,guildId);
+    if(request.method==="POST"){
+      const input=await bodyObject<{
+        name:string;description?:string;priceYen:number;
+        deliveryType:"role"|"text";roleId?:string|null;deliveryText?:string|null;
+      }>(request);
+      if(!input.name?.trim()||input.name.length>80) throw new HttpError(400,"商品名が不正です");
+      if(!Number.isInteger(input.priceYen)||input.priceYen<1||input.priceYen>1000000){
+        throw new HttpError(400,"価格が不正です");
+      }
+      if(input.deliveryType==="role"&&!input.roleId) throw new HttpError(400,"付与ロールが必要です");
+      if(input.deliveryType==="text"&&!input.deliveryText) throw new HttpError(400,"納品内容が必要です");
+      const row:ProductRow={
+        id:randomId(),guild_id:guildId,name:input.name.trim(),
+        description:(input.description||"").slice(0,500),
+        price_yen:input.priceYen,active:1,delivery_type:input.deliveryType,
+        role_id:input.roleId||null,delivery_text:input.deliveryText||null,created_at:Date.now()
+      };
+      return json(env,await createProduct(env,row),201);
+    }
+  }
+
+  const productDelete=url.pathname.match(/^\/api\/guilds\/(\d+)\/products\/([^/]+)$/);
+  if(productDelete&&request.method==="DELETE"){
+    await requireGuild(request,env,productDelete[1]!);
+    if(!(await deleteProduct(env,productDelete[1]!,productDelete[2]!))) throw new HttpError(404,"商品が見つかりません");
+    return json(env,{ok:true});
+  }
+
+  const productPanel=url.pathname.match(/^\/api\/guilds\/(\d+)\/products\/([^/]+)\/panel$/);
+  if(productPanel&&request.method==="POST"){
+    await requireGuild(request,env,productPanel[1]!);
+    const product=await getProduct(env,productPanel[2]!);
+    if(!product||product.guild_id!==productPanel[1]!||!product.active) throw new HttpError(404,"商品が見つかりません");
+    const {channelId}=await bodyObject<{channelId:string}>(request);
+    await publishProductPanel(env,productPanel[1]!,channelId,product);
+    return json(env,{ok:true});
+  }
+
+  throw new HttpError(404,"Not found");
 }
 
-// ── main fetch handler ────────────────────────────────────────────────────────
+async function oauthStart(request:Request,env:Env):Promise<Response>{
+  const state=randomToken(24);
+  await putOAuthState(env,state);
+  const origin=new URL(request.url).origin;
+  return new Response(null,{
+    status:302,
+    headers:{
+      Location:oauthAuthorizeUrl(env,origin,state),
+      "Set-Cookie":`dsm_oauth_state=${encodeURIComponent(state)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
+    }
+  });
+}
+
+async function oauthCallback(request:Request,env:Env):Promise<Response>{
+  const url=new URL(request.url);
+  const code=url.searchParams.get("code");
+  const state=url.searchParams.get("state");
+  const cookie=parseCookie(request.headers.get("Cookie"),"dsm_oauth_state");
+  if(!code||!state||!cookie||cookie!==state||!(await consumeOAuthState(env,state))){
+    throw new HttpError(400,"OAuth state mismatch");
+  }
+  const tokens=await exchangeCode(env,url.origin,code);
+  const user=await userJson<DiscordUser>("/users/@me",tokens.access_token);
+  const rawSession=randomToken(32);
+  await createSession(env,{
+    token_hash:await sha256Hex(rawSession),
+    user_id:user.id,
+    username:user.global_name||user.username,
+    avatar:user.avatar||null,
+    access_token_enc:await encrypt(env.SESSION_ENCRYPTION_KEY,tokens.access_token),
+    refresh_token_enc:await encrypt(env.SESSION_ENCRYPTION_KEY,tokens.refresh_token),
+    token_expires_at:Date.now()+tokens.expires_in*1000,
+    expires_at:Date.now()+30*24*60*60_000
+  });
+  return new Response(null,{
+    status:302,
+    headers:{
+      Location:`${env.WEB_PUBLIC_URL.replace(/\/$/,"")}/#session=${encodeURIComponent(rawSession)}`,
+      "Set-Cookie":"dsm_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+    }
+  });
+}
+
+async function neutralize(
+  env:Env,
+  guildId:string,
+  userId:string,
+  settings:GuildSettings,
+  context:{structuralDestruction:boolean}
+):Promise<void>{
+  if(settings.trustedUserIds.includes(userId)) return;
+  const guild=await botJson<{owner_id:string}>(env,`/guilds/${guildId}`);
+  if(guild.owner_id===userId) return;
+  const [member,roles]=await Promise.all([
+    botJson<DiscordGuildMember>(env,`/guilds/${guildId}/members/${userId}`),
+    botJson<DiscordRole[]>(env,`/guilds/${guildId}/roles`)
+  ]);
+  if(member.roles.some(id=>settings.trustedRoleIds.includes(id))) return;
+
+  if(member.user?.bot===true&&!context.structuralDestruction){
+    // A moderation/security bot can legitimately issue many bans during a
+    // raid. Do not strip its manually assigned privileged roles unless the
+    // same burst also contains structural destruction (channel/role deletes).
+    if(settings.logChannelId){
+      await sendMessage(env,settings.logChannelId,{
+        content:`ℹ️ Anti-Nuke: <@${userId}> はBotによる大量BANを実行しましたが、構造破壊を伴わないため自動ロール剥奪を行いませんでした。`
+      }).catch(()=>undefined);
+    }
+    return;
+  }
+
+  // Human administrators intentionally outrank every bot. The legacy fallback
+  // must not fight those operators when the independent Security Bot is absent.
+  // A malicious lower-ranked human is still inside Main Bot's moderation
+  // boundary, so only humans above Main (or an unverifiable Main hierarchy)
+  // receive this protection.
+  if(member.user?.bot!==true){
+    const botMember=await getBotGuildMember(env,guildId,roles);
+    const humanHighest=highestMemberRole(roles,member);
+    const botHighest=highestMemberRole(roles,botMember);
+    const protectedHumanOperator=
+      !botHighest ||
+      Boolean(humanHighest&&compareRoleHierarchy(humanHighest,botHighest)>0);
+    if(protectedHumanOperator){
+      if(settings.logChannelId){
+        await sendMessage(env,settings.logChannelId,{
+          content:botHighest
+            ? `⚠️ Anti-Nuke: <@${userId}> はMain Botより上位の人間管理者のため、自動ロール剥奪を行わず記録のみしました。`
+            : `⚠️ Anti-Nuke: <@${userId}> の操作を検知しましたが、Main Botのロール階層を確認できないため自動ロール剥奪を保留しました。`
+        }).catch(()=>undefined);
+      }
+      return;
+    }
+  }
+
+  for(const role of roles){
+    if(!member.roles.includes(role.id)||role.managed) continue;
+    if((BigInt(role.permissions)&DANGEROUS_PERMISSION_MASK)!==0n){
+      await botFetch(env,`/guilds/${guildId}/members/${userId}/roles/${role.id}`,{method:"DELETE"})
+        .catch(()=>undefined);
+    }
+  }
+  if(settings.logChannelId){
+    await sendMessage(env,settings.logChannelId,{
+      content:`⚠️ Anti-Nuke: <@${userId}> から危険権限ロールの解除を試みました。`
+    }).catch(()=>undefined);
+  }
+}
+
+async function auditWatch(env:Env):Promise<void>{
+  // Once the independent Security Bot bridge is configured, real-time Gateway
+  // protection becomes authoritative. Keep this cron guard only as a legacy
+  // fallback for installations that have not completed Security Bot setup.
+  if(securityBridgeConfigured(env)) return;
+  const guilds=await listAllGuildSettings(env,10);
+  for(const row of guilds){
+    let settings:GuildSettings;
+    try{settings={...DEFAULT_SETTINGS,...JSON.parse(row.config)};}catch{continue;}
+    if(!settings.securityEnabled||!settings.antiNuke) continue;
+    const payload=await botJson<{audit_log_entries:Array<{
+      id:string;action_type:number;user_id?:string|null;
+    }> }>(env,`/guilds/${row.guild_id}/audit-logs?limit=30`).catch(()=>null);
+    if(!payload?.audit_log_entries?.length) continue;
+    const newest=payload.audit_log_entries[0]!.id;
+    const cursor=await getAuditCursor(env,row.guild_id);
+    if(!cursor){
+      await setAuditCursor(env,row.guild_id,newest);
+      continue;
+    }
+    const fresh=[];
+    for(const entry of payload.audit_log_entries){
+      if(entry.id===cursor) break;
+      if(entry.user_id&&[12,22,32].includes(entry.action_type)) fresh.push(entry);
+    }
+    await setAuditCursor(env,row.guild_id,newest);
+    const byUser=new Map<string,Array<{at:number;actionType:number}>>();
+    for(const entry of fresh){
+      const events=byUser.get(entry.user_id!)??[];
+      events.push({
+        at:snowflakeTime(entry.id),
+        actionType:entry.action_type
+      });
+      byUser.set(entry.user_id!,events);
+    }
+    const windowMs=settings.nukeWindowSeconds*1000;
+    for(const [userId,events] of byUser){
+      events.sort((a,b)=>a.at-b.at);
+      let left=0;
+      let hitWindow:Array<{at:number;actionType:number}>|null=null;
+      for(let right=0;right<events.length;right++){
+        while(events[right]!.at-events[left]!.at>windowMs) left++;
+        if(right-left+1>=settings.nukeActions){
+          hitWindow=events.slice(left,right+1);
+          break;
+        }
+      }
+      if(hitWindow){
+        const structuralDestruction=hitWindow.some(
+          event=>event.actionType===12||event.actionType===32
+        );
+        await neutralize(
+          env,
+          row.guild_id,
+          userId,
+          settings,
+          {structuralDestruction}
+        ).catch(console.error);
+      }
+    }
+  }
+}
+
+async function paymentSweep(env:Env):Promise<void>{
+  for(const payment of await listPendingPayments(env,8)){
+    await confirmAndDeliver(env,payment).catch(console.error);
+  }
+}
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const cors = corsHeaders(env);
+  async fetch(request:Request,rawEnv:Env,ctx:ExecutionContext):Promise<Response>{
+    const env=await withIntegratedSecurity(rawEnv,ctx);
+    try{
+      const url=new URL(request.url);
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors });
-    }
+      if(request.method==="OPTIONS"){
+        return new Response(null,{status:204,headers:corsHeaders(env)});
+      }
+      if(url.pathname==="/"||url.pathname==="/health"){
+        let d1Reachable=false;
+        let d1Error:string|null=null;
+        if(env.DB){
+          try{
+            await env.DB.prepare("SELECT 1 AS ok").first();
+            d1Reachable=true;
+          }catch(error){
+            d1Error=error instanceof Error?error.message:String(error);
+          }
+        }
+        let d1SchemaReady=false;
+        if(d1Reachable){
+          try{
+            await ensureSchema(env);
+            d1SchemaReady=true;
+          }catch(error){
+            console.error("D1 schema initialization failed",error);
+          }
+        }
+        const dashboardSessionStorage=env.DB
+          ?await dashboardSessionStorageReady(env)
+          :false;
 
-    try {
-      if (url.pathname === "/interactions" && request.method === "POST") {
-        return handleInteraction(request, env, ctx);
+        let discordApiReachable=false;
+        let discordBotId:string|null=null;
+        let discordBotUsername:string|null=null;
+        let discordGuildCount:number|null=null;
+        let discordApplicationMatchesToken:boolean|null=null;
+        let discordApiError:string|null=null;
+        try{
+          const bot=await botJson<{id:string;username:string}>(env,"/users/@me");
+          discordApiReachable=true;
+          discordBotId=bot.id;
+          discordBotUsername=bot.username;
+          discordApplicationMatchesToken=bot.id===env.DISCORD_APPLICATION_ID.trim();
+          // Do not call /users/@me/guilds from health; dashboard bootstrap owns that request.
+          // This prevents health checks from consuming the same Discord REST rate-limit bucket.
+          discordGuildCount=null;
+        }catch(error){
+          discordApiError=error instanceof Error?error.message:String(error);
+        }
+
+        return json(env,{
+          ok:d1Reachable&&d1SchemaReady&&dashboardSessionStorage&&discordApiReachable,
+          version:"bot-coexistence-v88-records-member-picker",
+          runtime:"cloudflare-workers",
+          discord:{
+            applicationId:Boolean(env.DISCORD_APPLICATION_ID),
+            publicKey:Boolean(env.DISCORD_PUBLIC_KEY),
+            botToken:Boolean(env.DISCORD_BOT_TOKEN),
+            clientSecret:Boolean(env.DISCORD_CLIENT_SECRET),
+            apiReachable:discordApiReachable,
+            botId:discordBotId,
+            botUsername:discordBotUsername,
+            guildCount:discordGuildCount,
+            applicationMatchesToken:discordApplicationMatchesToken,
+            apiError:discordApiError
+          },
+          encryptionKey:Boolean(env.SESSION_ENCRYPTION_KEY),
+          dashboardPassword:Boolean(env.DASHBOARD_PASSWORD),
+          dashboardSessionStorage,
+          d1:{
+            bound:Boolean(env.DB),
+            reachable:d1Reachable,
+            schemaReady:d1SchemaReady,
+            error:d1Error
+          }
+        });
+      }
+      const recoveryOAuth=await handleRecoveryOAuth(request,env,url);
+      if(recoveryOAuth) return recoveryOAuth;
+
+      if(url.pathname==="/interactions"&&request.method==="POST"){
+        return await handleInteraction(request,env,ctx);
+      }
+      if(url.pathname==="/api/login"&&request.method==="POST"){
+        return await handleDashboardLogin(request,env);
       }
 
-      if (url.pathname.startsWith("/api/")) {
-        const res = await handleApi(request, env, url, ctx);
-        return res;
+      // Read-only dashboard bootstrap routes must not depend on the full historical schema.
+      // Their only DB dependency is dashboard_sessions, which self-heals in sessionFromRequest().
+      if(
+        (url.pathname==="/api/status"&&request.method==="GET")||
+        (url.pathname==="/api/me"&&request.method==="GET")||
+        (url.pathname==="/api/guilds"&&request.method==="GET")||
+        (/^\/api\/guilds\/\d+\/meta$/.test(url.pathname)&&request.method==="GET")||
+        (/^\/api\/guilds\/\d+\/channels\/reorder$/.test(url.pathname)&&request.method==="PATCH")||
+        (/^\/api\/guilds\/\d+\/channels\/\d+\/permissions\/\d+$/.test(url.pathname)&&request.method==="PATCH")||
+        (/^\/api\/guilds\/\d+\/channels\/permissions\/bulk$/.test(url.pathname)&&request.method==="PATCH")||
+        (/^\/api\/guilds\/\d+\/roles(?:\/\d+)?$/.test(url.pathname)&&["POST","PATCH","DELETE"].includes(request.method))||
+        (/^\/api\/guilds\/\d+\/(verification|tickets)\/panel$/.test(url.pathname)&&request.method==="POST")
+      ){
+        return await handleApi(request,env,url);
       }
 
-      return new Response("cc-server worker", { status: 200 });
-    } catch (err) {
-      if (err instanceof HttpError) {
-        return json({ error: err.message }, { status: err.status, env });
+      await ensureSchema(env);
+
+      const relayResponse=await handleGatewayRelay(request,env,url);
+      if(relayResponse) return relayResponse;
+
+      if(url.pathname.startsWith("/media/vending/")){
+        const mediaResponse=await handleVendingMedia(request,env,url);
+        if(mediaResponse) return mediaResponse;
       }
-      if (err instanceof DiscordApiError) {
-        return json({ error: `Discord APIエラー: ${err.message}` }, { status: 502, env });
+      if(url.pathname.startsWith("/api/")){
+        const backupResponse=await handleBackupApi(request,env,url);
+        if(backupResponse) return backupResponse;
+        const isVendingRoute=
+          url.pathname.startsWith("/api/vending/")||
+          /^\/api\/guilds\/\d+\/vending(?:\/|$)/.test(url.pathname);
+        if(isVendingRoute){
+          const vendingResponse=await handleVendingApi(request,env,url);
+          if(vendingResponse) return vendingResponse;
+        }
+        if(/^\/api\/guilds\/\d+\/mediation(?:\/|$)/.test(url.pathname)){
+          const mediationResponse=await handleMediationApi(request,env,url,{
+            registerCommands:()=>registerCommands(env)
+          });
+          if(mediationResponse) return mediationResponse;
+        }
+        return await handleApi(request,env,url);
       }
-      console.error("worker error", err);
-      return json({ error: "内部エラーが発生しました" }, { status: 500, env });
+      throw new HttpError(404,"Not found");
+    }catch(error){
+      console.error(error);
+      const status=
+        error instanceof HttpError?error.status:
+        error instanceof VendingHttpError?error.status:
+        error instanceof MediationHttpError?error.status:
+        error instanceof BackupHttpError?error.status:
+        error instanceof DiscordApiError?(error.status===429?429:error.status===403?403:502):
+        500;
+      const message=
+        error instanceof DiscordApiError&&error.status===403
+          ?error.message.includes('"code":50001')||error.message.includes('"code": 50001')
+            ?"BOTが対象にアクセスできません。対象カテゴリ/チャンネルでBOT個別の「チャンネルを見る」を許可し、BOTロールの「チャンネルの管理」「ロールの管理」を確認してください。Administratorは必須ではありません"
+            :error.message.includes('"code":50013')||error.message.includes('"code": 50013')
+              ?"BOTにこの操作の権限がありません。BOTのサーバーロールとロールの並び順、チャンネル個別の権限を確認してください"
+              :"DiscordがBOTの操作を拒否しました。BOTのサーバーロールと対象チャンネルの権限を確認してください"
+          :error instanceof HttpError||error instanceof VendingHttpError||error instanceof MediationHttpError||error instanceof BackupHttpError||error instanceof DiscordApiError
+            ?error.message
+            :"サーバー処理に失敗しました";
+      return json(env,{error:status>=500?"server_error":"request_error",message},status);
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller:ScheduledController,rawEnv:Env,ctx:ExecutionContext):Promise<void>{
+    const env=await withIntegratedSecurity(rawEnv,ctx);
+    // Discord-Security (統合): 監査ログ照合・Gateway維持・Lockdown自動解除
+    ctx.waitUntil(securityScheduled(controller,rawEnv,ctx).catch(error=>console.error("security scheduled failed",error)));
+    await ensureSchema(env);
     ctx.waitUntil(Promise.all([
-      ensureSchema(env).then(() => cleanExpiredSessions(env)).catch(console.error),
-      ensureSchema(env).then(() => cleanExpiredAvSessions(env)).catch(console.error),
-      ensureSchema(env).then(() => runSecurityScheduled(env)).catch(err => console.error("security scheduled run failed", err)),
-    ]));
-  },
+      cleanExpiredAvSessions(env).catch(error=>console.error("amazon vending session cleanup failed",error)),
+      cleanExpired(env),
+      auditWatch(env),
+      paymentSweep(env),
+      vendingSweep(env),
+      mediationSweep(env).catch(error=>console.error("mediation sweep failed",error)),
+      retireDiscordGateway(env).catch(error=>console.error("discord gateway retire failed",error)),
+      syncCommandsIfChanged(env).catch(error=>console.error("command sync failed",error)),
+      memberActivitySweep(env).catch(error=>console.error("member activity sweep failed",error)),
+      botAccessGuardSweep(env),
+      backupRestoreSweep(env)
+    ]).then(()=>undefined));
+  }
 } satisfies ExportedHandler<Env>;
