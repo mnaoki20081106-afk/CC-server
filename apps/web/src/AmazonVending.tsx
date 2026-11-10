@@ -80,7 +80,7 @@ export default function AmazonVending({
                 </option>
               ))}
             </select>
-            <small>購入時のプライベートチャンネルに「実績を投稿する」パネルが付きます。購入者が入力した感想と画像1枚を、このチャンネルへAmazon実績として送信します。</small>
+            <small>購入時のプライベートチャンネルに「実績を投稿する」パネルが付きます。購入者が入力した感想と画像1枚を、このチャンネルへ実績として送信します。</small>
           </label>
         </div>
 

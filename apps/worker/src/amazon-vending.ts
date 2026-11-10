@@ -246,10 +246,10 @@ const REVIEW_IMAGE_TYPES: Record<string, string> = {
 function reviewPanelMessage(orderId: string, posted: boolean): unknown {
   return {
     embeds: [{
-      title: posted ? "✅ Amazon実績を投稿しました" : "📸 Amazon実績を投稿",
+      title: posted ? "✅ 実績を投稿しました" : "📸 実績を投稿",
       description: posted
         ? "ご協力ありがとうございました！"
-        : "商品を受け取ったら、感想と商品の写真を1枚投稿してください。\n投稿内容はAmazon実績として公開されます。",
+        : "商品を受け取ったら、感想と商品の写真を1枚投稿してください。\n投稿内容は実績として公開されます。",
       color: posted ? 0x57f287 : 0xff9900,
     }],
     components: [{
@@ -302,7 +302,7 @@ export async function handleAvReviewButton(interaction: any, env: Env): Promise<
     type: 9,
     data: {
       custom_id: `av:review_modal:${orderId}`,
-      title: "Amazon実績を投稿",
+      title: "実績を投稿",
       components: [
         {
           type: 18,
@@ -386,7 +386,7 @@ export async function handleAvReviewModal(interaction: any, env: Env, ctx: Execu
       const form = new FormData();
       form.set("payload_json", JSON.stringify({
         embeds: [{
-          title: "📦 Amazon実績",
+          title: "📦 実績",
           color: 0xff9900,
           description: review.slice(0, 1000),
           fields: [
