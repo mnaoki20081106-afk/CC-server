@@ -134,6 +134,20 @@ CREATE TABLE IF NOT EXISTS amazon_vending_sessions (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS amazon_vending_orders (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  channel_id TEXT,
+  product_title TEXT NOT NULL,
+  price_jpy INTEGER NOT NULL,
+  image_url TEXT,
+  review_posted_at INTEGER,
+  review_message_id TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS amazon_vending_orders_guild_idx ON amazon_vending_orders(guild_id, created_at);
+
 CREATE TABLE IF NOT EXISTS guild_config (
   guild_id TEXT PRIMARY KEY,
   admin_role_id TEXT,
@@ -174,6 +188,7 @@ export async function ensureSchema(env: Env): Promise<void> {
           ON CONFLICT(key) DO UPDATE SET value='5'
         `)
       ]);
+      await migrateAmazonVendingSchema(env);
     })();
     schemaInitializations.set(env.DB, initialization);
     initialization.catch(() => schemaInitializations.delete(env.DB));
@@ -590,7 +605,16 @@ export async function getGuildConfig(env: Env, guildId: string): Promise<GuildCo
   return (await env.DB.prepare("SELECT * FROM guild_config WHERE guild_id=?").bind(guildId).first<GuildConfig>())!;
 }
 
-export type AvConfig = { guild_id: string; panel_title: string; panel_description: string | null; ltc_address: string | null; api_type: string; api_key: string | null };
+export type AvConfig = { guild_id: string; panel_title: string; panel_description: string | null; ltc_address: string | null; api_type: string; api_key: string | null; review_channel_id: string | null };
+
+// 既存の amazon_vending_config に実績投稿チャンネル列を追加する (CREATE TABLE IF NOT EXISTS では列が増えないため)
+async function migrateAmazonVendingSchema(env: Env): Promise<void> {
+  const { results } = await env.DB.prepare("PRAGMA table_info(amazon_vending_config)").all<{ name: string }>();
+  const columns = new Set((results ?? []).map(row => String(row.name)));
+  if (!columns.has("review_channel_id")) {
+    await env.DB.prepare("ALTER TABLE amazon_vending_config ADD COLUMN review_channel_id TEXT").run();
+  }
+}
 
 export async function getAvConfig(env: Env, guildId: string): Promise<AvConfig> {
   const row = await env.DB.prepare("SELECT * FROM amazon_vending_config WHERE guild_id=?").bind(guildId).first<AvConfig>();
@@ -601,20 +625,22 @@ export async function getAvConfig(env: Env, guildId: string): Promise<AvConfig> 
     ltc_address: null,
     api_type: "rainforest",
     api_key: null,
+    review_channel_id: null,
   };
 }
 
 export async function upsertAvConfig(env: Env, cfg: AvConfig): Promise<void> {
   await env.DB.prepare(`
-    INSERT INTO amazon_vending_config(guild_id,panel_title,panel_description,ltc_address,api_type,api_key)
-    VALUES(?,?,?,?,?,?)
+    INSERT INTO amazon_vending_config(guild_id,panel_title,panel_description,ltc_address,api_type,api_key,review_channel_id)
+    VALUES(?,?,?,?,?,?,?)
     ON CONFLICT(guild_id) DO UPDATE SET
       panel_title=excluded.panel_title,
       panel_description=excluded.panel_description,
       ltc_address=excluded.ltc_address,
       api_type=excluded.api_type,
-      api_key=excluded.api_key
-  `).bind(cfg.guild_id, cfg.panel_title, cfg.panel_description, cfg.ltc_address, cfg.api_type, cfg.api_key).run();
+      api_key=excluded.api_key,
+      review_channel_id=excluded.review_channel_id
+  `).bind(cfg.guild_id, cfg.panel_title, cfg.panel_description, cfg.ltc_address, cfg.api_type, cfg.api_key, cfg.review_channel_id).run();
 }
 
 export type AvSession = { id: string; guild_id: string; user_id: string; asin: string; product_json: string; created_at: number };
@@ -636,4 +662,49 @@ export async function deleteAvSession(env: Env, id: string): Promise<void> {
 export async function cleanExpiredAvSessions(env: Env): Promise<void> {
   const cutoff = Date.now() - 30 * 60 * 1000;
   await env.DB.prepare("DELETE FROM amazon_vending_sessions WHERE created_at<?").bind(cutoff).run();
+}
+
+// ── Amazon自販機: 注文と実績投稿 ──────────────────────────────────────────────
+
+export type AvOrder = {
+  id: string;
+  guild_id: string;
+  user_id: string;
+  channel_id: string | null;
+  product_title: string;
+  price_jpy: number;
+  image_url: string | null;
+  review_posted_at: number | null;
+  review_message_id: string | null;
+  created_at: number;
+};
+
+export async function createAvOrder(env: Env, order: Omit<AvOrder, "review_posted_at" | "review_message_id">): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO amazon_vending_orders(id,guild_id,user_id,channel_id,product_title,price_jpy,image_url,created_at) VALUES(?,?,?,?,?,?,?,?)"
+  ).bind(order.id, order.guild_id, order.user_id, order.channel_id, order.product_title, order.price_jpy, order.image_url, order.created_at).run();
+}
+
+export async function setAvOrderChannel(env: Env, id: string, channelId: string): Promise<void> {
+  await env.DB.prepare("UPDATE amazon_vending_orders SET channel_id=? WHERE id=?").bind(channelId, id).run();
+}
+
+export async function getAvOrder(env: Env, id: string): Promise<AvOrder | null> {
+  return env.DB.prepare("SELECT * FROM amazon_vending_orders WHERE id=?").bind(id).first<AvOrder>();
+}
+
+/** 実績投稿の二重送信を防ぐため、未投稿の注文だけを投稿中として確保する。確保できたら true。 */
+export async function claimAvOrderReview(env: Env, id: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    "UPDATE amazon_vending_orders SET review_posted_at=? WHERE id=? AND review_posted_at IS NULL"
+  ).bind(Date.now(), id).run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function completeAvOrderReview(env: Env, id: string, messageId: string): Promise<void> {
+  await env.DB.prepare("UPDATE amazon_vending_orders SET review_message_id=? WHERE id=?").bind(messageId, id).run();
+}
+
+export async function releaseAvOrderReview(env: Env, id: string): Promise<void> {
+  await env.DB.prepare("UPDATE amazon_vending_orders SET review_posted_at=NULL WHERE id=? AND review_message_id IS NULL").bind(id).run();
 }

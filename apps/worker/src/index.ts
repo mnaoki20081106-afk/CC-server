@@ -93,7 +93,7 @@ export { DiscordGateway } from "./discord-gateway";
 export { DiscordSecurityGateway } from "./security-integration";
 import { securityScheduled, withIntegratedSecurity } from "./security-integration";
 // Amazon自販機 (CC-server)
-import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal } from "./amazon-vending";
+import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal, handleAvReviewButton, handleAvReviewModal } from "./amazon-vending";
 import {
   openSecurityMaintenanceLease,
   securityBridgeConfigured,
@@ -1542,6 +1542,16 @@ async function processInteraction(
     // Amazon自販機 address modal: av:addr_modal:<sessionId>[:<variantAsin>:<priceJpy>]
     if (type === 5 && customId.startsWith("av:addr_modal:")) {
       return handleAvAddrModal(interaction, env, ctx);
+    }
+
+    // Amazon自販機 実績投稿ボタン: av:review:<orderId>
+    if (type === 3 && customId.startsWith("av:review:")) {
+      return handleAvReviewButton(interaction, env);
+    }
+
+    // Amazon自販機 実績投稿モーダル: av:review_modal:<orderId>
+    if (type === 5 && customId.startsWith("av:review_modal:")) {
+      return handleAvReviewModal(interaction, env, ctx);
     }
   }
 
@@ -3164,7 +3174,9 @@ async function handleApi(request:Request,env:Env,url:URL):Promise<Response>{
       const ltc = String(body.ltc_address ?? "").trim();
       const apiType = ["rainforest", "keepa", "canopy"].includes(body.api_type) ? body.api_type : "rainforest";
       const apiKey = String(body.api_key ?? "").trim();
-      await upsertAvConfig(env, { guild_id: guildId, panel_title: title, panel_description: desc || null, ltc_address: ltc || null, api_type: apiType, api_key: apiKey || null });
+      const reviewChannelId = String(body.review_channel_id ?? "").trim();
+      if (reviewChannelId && !/^\d{17,22}$/.test(reviewChannelId)) throw new HttpError(400, "実績投稿チャンネルが不正です");
+      await upsertAvConfig(env, { guild_id: guildId, panel_title: title, panel_description: desc || null, ltc_address: ltc || null, api_type: apiType, api_key: apiKey || null, review_channel_id: reviewChannelId || null });
       return json(env, { ok: true });
     }
   }

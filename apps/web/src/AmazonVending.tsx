@@ -11,6 +11,7 @@ export type AvConfig = {
   ltc_address: string | null;
   api_type: string;
   api_key: string | null;
+  review_channel_id: string | null;
 };
 
 // Matches exactly what POST /api/guilds/:id/amazon-vending/panel sends
@@ -68,6 +69,18 @@ export default function AmazonVending({
           <label className="field">
             <span>APIキー</span>
             <input type="password" value={draft.api_key ?? ""} onChange={e => setDraft({ ...draft, api_key: e.target.value })} />
+          </label>
+          <label className="field" style={{ gridColumn: "1 / -1" }}>
+            <span>実績投稿チャンネル</span>
+            <select value={draft.review_channel_id ?? ""} onChange={e => setDraft({ ...draft, review_channel_id: e.target.value || null })}>
+              <option value="">未設定（実績投稿を受け付けない）</option>
+              {meta.channels.map(c => (
+                <option key={c.id} value={c.id}>
+                  #{c.name}
+                </option>
+              ))}
+            </select>
+            <small>購入時のプライベートチャンネルに「実績を投稿する」パネルが付きます。購入者が入力した感想と画像1枚を、このチャンネルへAmazon実績として送信します。</small>
           </label>
         </div>
 

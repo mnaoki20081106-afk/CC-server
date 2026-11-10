@@ -1,5 +1,8 @@
 import type { Env } from "./types";
-import { ensureSchema, getAvConfig, createAvSession, getAvSession, deleteAvSession, getGuildConfig, type AvConfig } from "./db";
+import {
+  ensureSchema, getAvConfig, createAvSession, getAvSession, deleteAvSession, getGuildConfig, type AvConfig,
+  createAvOrder, setAvOrderChannel, getAvOrder, claimAvOrderReview, completeAvOrderReview, releaseAvOrderReview,
+} from "./db";
 import { randomToken } from "./utils";
 import { botJson } from "./discord";
 
@@ -154,6 +157,8 @@ export async function calcLtcAmount(jpy: number): Promise<number> {
 
 async function createTicketChannel(
   env: Env,
+  orderId: string,
+  imageUrl: string | null,
   guildId: string,
   userId: string,
   username: string,
@@ -184,10 +189,22 @@ async function createTicketChannel(
   };
   if (guildCfg.ticket_category_id) channelPayload.parent_id = String(guildCfg.ticket_category_id);
 
+  await createAvOrder(env, {
+    id: orderId,
+    guild_id: guildId,
+    user_id: userId,
+    channel_id: null,
+    product_title: productTitle.slice(0, 500),
+    price_jpy: Math.round(priceJpy),
+    image_url: imageUrl,
+    created_at: Date.now(),
+  });
+
   const channel = await botJson<{ id: string }>(env, `/guilds/${guildId}/channels`, {
     method: "POST",
     body: JSON.stringify(channelPayload),
   });
+  await setAvOrderChannel(env, orderId, channel.id);
 
   await botJson(env, `/channels/${channel.id}/messages`, {
     method: "POST",
@@ -208,6 +225,209 @@ async function createTicketChannel(
       }],
     }),
   });
+
+  // 番号の下に実績投稿パネルを設置
+  await botJson(env, `/channels/${channel.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify(reviewPanelMessage(orderId, false)),
+  });
+}
+
+// ── 実績投稿 ──────────────────────────────────────────────────────────────────
+
+const REVIEW_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const REVIEW_IMAGE_TYPES: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
+
+function reviewPanelMessage(orderId: string, posted: boolean): unknown {
+  return {
+    embeds: [{
+      title: posted ? "✅ Amazon実績を投稿しました" : "📸 Amazon実績を投稿",
+      description: posted
+        ? "ご協力ありがとうございました！"
+        : "商品を受け取ったら、感想と商品の写真を1枚投稿してください。\n投稿内容はAmazon実績として公開されます。",
+      color: posted ? 0x57f287 : 0xff9900,
+    }],
+    components: [{
+      type: 1,
+      components: [{
+        type: 2,
+        custom_id: `av:review:${orderId}`,
+        label: posted ? "投稿済み" : "実績を投稿する",
+        style: posted ? 2 : 3,
+        emoji: { name: posted ? "✅" : "📝" },
+        disabled: posted,
+      }],
+    }],
+  };
+}
+
+// Discord のモーダル送信は Label (type 18) か Action Row (type 1) の中に入力部品が入る
+function findModalComponent(interaction: any, customId: string): any | null {
+  const stack: any[] = [...((interaction.data?.components as any[] | undefined) ?? [])];
+  while (stack.length) {
+    const item = stack.shift();
+    if (!item) continue;
+    if (item.custom_id === customId) return item;
+    if (item.component) stack.push(item.component);
+    if (Array.isArray(item.components)) stack.push(...item.components);
+  }
+  return null;
+}
+
+// 購入チャンネルの「実績を投稿する」ボタン: av:review:<orderId>
+export async function handleAvReviewButton(interaction: any, env: Env): Promise<Response> {
+  const orderId = String(interaction.data?.custom_id ?? "").split(":")[2] ?? "";
+  const userId = String(interaction.member?.user?.id ?? interaction.user?.id ?? "");
+  await ensureSchema(env);
+  const order = await getAvOrder(env, orderId);
+  if (!order || order.guild_id !== String(interaction.guild_id ?? "")) {
+    return interactionResponse(ephemeral("この注文は見つかりませんでした。"));
+  }
+  if (order.user_id !== userId) {
+    return interactionResponse(ephemeral("実績を投稿できるのは購入者本人だけです。"));
+  }
+  if (order.review_posted_at) {
+    return interactionResponse(ephemeral("この注文の実績はすでに投稿済みです。"));
+  }
+  const cfg = await getAvConfig(env, order.guild_id);
+  if (!cfg.review_channel_id) {
+    return interactionResponse(ephemeral("実績投稿チャンネルが設定されていません。スタッフにお問い合わせください。"));
+  }
+  return interactionResponse({
+    type: 9,
+    data: {
+      custom_id: `av:review_modal:${orderId}`,
+      title: "Amazon実績を投稿",
+      components: [
+        {
+          type: 18,
+          label: "感想",
+          description: "商品やお取引の感想を入力してください",
+          component: {
+            type: 4,
+            custom_id: "review",
+            style: 2,
+            placeholder: "例：注文から受け取りまでスムーズでした！",
+            required: true,
+            min_length: 1,
+            max_length: 1000,
+          },
+        },
+        {
+          type: 18,
+          label: "画像",
+          description: "商品の写真を1枚添付してください（PNG / JPEG / GIF / WebP、10MBまで）",
+          component: {
+            type: 19,
+            custom_id: "image",
+            min_values: 1,
+            max_values: 1,
+            required: true,
+          },
+        },
+      ],
+    },
+  });
+}
+
+// 実績投稿モーダルの送信: av:review_modal:<orderId>
+export async function handleAvReviewModal(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const orderId = String(interaction.data?.custom_id ?? "").split(":")[2] ?? "";
+  const userId = String(interaction.member?.user?.id ?? interaction.user?.id ?? "");
+  const review = String(findModalComponent(interaction, "review")?.value ?? "").trim();
+  const attachmentId = String(findModalComponent(interaction, "image")?.values?.[0] ?? "");
+  const attachment = attachmentId ? interaction.data?.resolved?.attachments?.[attachmentId] : null;
+
+  if (!review) return interactionResponse(ephemeral("感想を入力してください。"));
+  if (!attachment?.url) return interactionResponse(ephemeral("画像を1枚添付してください。"));
+  const contentType = String(attachment.content_type ?? "").split(";")[0]!.trim().toLowerCase();
+  const extension = REVIEW_IMAGE_TYPES[contentType];
+  if (!extension) return interactionResponse(ephemeral("画像は PNG / JPEG / GIF / WebP で添付してください。"));
+  if (Number(attachment.size ?? 0) > REVIEW_MAX_IMAGE_BYTES) {
+    return interactionResponse(ephemeral("画像は10MB以下にしてください。"));
+  }
+
+  await ensureSchema(env);
+  const order = await getAvOrder(env, orderId);
+  if (!order || order.guild_id !== String(interaction.guild_id ?? "")) {
+    return interactionResponse(ephemeral("この注文は見つかりませんでした。"));
+  }
+  if (order.user_id !== userId) {
+    return interactionResponse(ephemeral("実績を投稿できるのは購入者本人だけです。"));
+  }
+  const cfg = await getAvConfig(env, order.guild_id);
+  if (!cfg.review_channel_id) {
+    return interactionResponse(ephemeral("実績投稿チャンネルが設定されていません。スタッフにお問い合わせください。"));
+  }
+  if (!(await claimAvOrderReview(env, orderId))) {
+    return interactionResponse(ephemeral("この注文の実績はすでに投稿済みです。"));
+  }
+
+  const appId = env.DISCORD_APPLICATION_ID;
+  const token = String(interaction.token ?? "");
+  const panelMessageId = String(interaction.message?.id ?? "");
+  const panelChannelId = String(interaction.channel_id ?? order.channel_id ?? "");
+  const reviewChannelId = cfg.review_channel_id;
+
+  ctx.waitUntil((async () => {
+    try {
+      // Discord の添付URLは期限付きなので、画像を取得して実績チャンネルへ添付し直す
+      const imageRes = await fetch(String(attachment.url));
+      if (!imageRes.ok) throw new Error(`image download ${imageRes.status}`);
+      const image = await imageRes.arrayBuffer();
+      if (image.byteLength > REVIEW_MAX_IMAGE_BYTES) throw new Error("image too large");
+      const filename = `amazon-review.${extension}`;
+
+      const form = new FormData();
+      form.set("payload_json", JSON.stringify({
+        embeds: [{
+          title: "📦 Amazon実績",
+          color: 0xff9900,
+          description: review.slice(0, 1000),
+          fields: [
+            { name: "購入者", value: `<@${order.user_id}>`, inline: true },
+            { name: "Amazon価格", value: `¥${Number(order.price_jpy).toLocaleString("ja-JP")}`, inline: true },
+            { name: "商品", value: order.product_title.slice(0, 1024), inline: false },
+          ],
+          image: { url: `attachment://${filename}` },
+          timestamp: new Date().toISOString(),
+        }],
+        attachments: [{ id: 0, filename }],
+        allowed_mentions: { parse: [] },
+      }));
+      form.set("files[0]", new File([image], filename, { type: contentType }));
+      // botFetch はボディがあると Content-Type を application/json に固定するので、multipart は直接送る
+      const postRes = await fetch(`https://discord.com/api/v10/channels/${reviewChannelId}/messages`, {
+        method: "POST",
+        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}` },
+        body: form,
+      });
+      if (!postRes.ok) throw new Error(`review post ${postRes.status}: ${(await postRes.text().catch(() => "")).slice(0, 200)}`);
+      const posted = await postRes.json() as { id: string };
+      await completeAvOrderReview(env, orderId, posted.id);
+
+      if (panelMessageId && panelChannelId) {
+        await botJson(env, `/channels/${panelChannelId}/messages/${panelMessageId}`, {
+          method: "PATCH",
+          body: JSON.stringify(reviewPanelMessage(orderId, true)),
+        }).catch(err => console.error("av review panel update failed", err));
+      }
+      await patchInteraction(appId, token, { content: `✅ 実績を投稿しました：<#${reviewChannelId}>` });
+    } catch (err) {
+      console.error("av review post failed", orderId, err);
+      await releaseAvOrderReview(env, orderId).catch(() => {});
+      await patchInteraction(appId, token, {
+        content: "実績の投稿に失敗しました。時間をおいてもう一度お試しください。",
+      }).catch(() => {});
+    }
+  })());
+
+  return deferEphemeral();
 }
 
 // ── Address modal (shared) ────────────────────────────────────────────────────
@@ -463,10 +683,11 @@ export async function handleAvAddrModal(interaction: any, env: Env, ctx: Executi
   const ltcAmount = await calcLtcAmount(priceJpy);
   const { inquiry, confirmation } = genPickupNumbers();
   const finalStoreName = storeName ?? address;
+  const orderId = randomToken(12);
 
   ctx.waitUntil(
     Promise.all([
-      createTicketChannel(env, guildId, userId, username, title, priceJpy, ltcAmount, finalStoreName, inquiry, confirmation),
+      createTicketChannel(env, orderId, imageUrl, guildId, userId, username, title, priceJpy, ltcAmount, finalStoreName, inquiry, confirmation),
       deleteAvSession(env, sessionId),
     ]).catch(err => console.error("av ticket channel error", err))
   );
