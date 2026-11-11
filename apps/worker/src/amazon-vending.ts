@@ -266,6 +266,143 @@ function reviewPanelMessage(orderId: string, posted: boolean): unknown {
   };
 }
 
+/** 実績チャンネルへの投稿。購入チャンネルのパネルからも、手動の /実績 コマンドからも同じ見た目で送る。 */
+async function postReviewMessage(env: Env, channelId: string, input: {
+  buyerId: string;
+  priceJpy: number;
+  productTitle: string;
+  review: string;
+  imageUrl: string;
+  contentType: string;
+  extension: string;
+}): Promise<string> {
+  // Discord の添付URLは期限付きなので、画像を取得して実績チャンネルへ添付し直す
+  const imageRes = await fetch(input.imageUrl);
+  if (!imageRes.ok) throw new Error(`image download ${imageRes.status}`);
+  const image = await imageRes.arrayBuffer();
+  if (image.byteLength > REVIEW_MAX_IMAGE_BYTES) throw new Error("image too large");
+  const filename = `amazon-review.${input.extension}`;
+
+  const form = new FormData();
+  form.set("payload_json", JSON.stringify({
+    embeds: [{
+      title: "📦 実績",
+      color: 0xff9900,
+      description: input.review.slice(0, 1000),
+      fields: [
+        { name: "購入者", value: `<@${input.buyerId}>`, inline: true },
+        { name: "Amazon価格", value: `¥${Number(input.priceJpy).toLocaleString("ja-JP")}`, inline: true },
+        { name: "商品", value: input.productTitle.slice(0, 1024), inline: false },
+      ],
+      image: { url: `attachment://${filename}` },
+      timestamp: new Date().toISOString(),
+    }],
+    attachments: [{ id: 0, filename }],
+    allowed_mentions: { parse: [] },
+  }));
+  form.set("files[0]", new File([image], filename, { type: input.contentType }));
+  // botFetch はボディがあると Content-Type を application/json に固定するので、multipart は直接送る
+  const postRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}` },
+    body: form,
+  });
+  if (!postRes.ok) throw new Error(`review post ${postRes.status}: ${(await postRes.text().catch(() => "")).slice(0, 200)}`);
+  return (await postRes.json() as { id: string }).id;
+}
+
+// ── 手動の実績投稿: /実績 (管理者権限を持つメンバー / オーナーのみ) ────────────
+
+const ADMINISTRATOR = 8n;
+
+export const AV_REVIEW_COMMAND = {
+  name: "実績",
+  description: "実績チャンネルへ手動で実績を投稿します（管理者のみ）",
+  type: 1,
+  dm_permission: false,
+  // 管理者権限を持たないメンバーにはコマンド自体を表示しない
+  default_member_permissions: ADMINISTRATOR.toString(),
+  options: [
+    { type: 6, name: "購入者", description: "購入者", required: true },
+    { type: 3, name: "商品", description: "商品名", required: true, max_length: 500 },
+    { type: 4, name: "価格", description: "Amazon価格（円）", required: true, min_value: 1, max_value: 10000000 },
+    { type: 3, name: "感想", description: "感想", required: true, max_length: 1000 },
+    { type: 11, name: "画像", description: "商品の写真（PNG / JPEG / GIF / WebP、10MBまで）", required: true },
+  ],
+};
+
+export function isAvReviewCommand(interaction: any): boolean {
+  return interaction?.type === 2 && interaction?.data?.name === AV_REVIEW_COMMAND.name;
+}
+
+function hasAdministrator(interaction: any): boolean {
+  try {
+    return (BigInt(String(interaction.member?.permissions ?? "0")) & ADMINISTRATOR) === ADMINISTRATOR;
+  } catch {
+    return false;
+  }
+}
+
+export async function handleAvReviewCommand(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const guildId = String(interaction.guild_id ?? "");
+  if (!guildId) return interactionResponse(ephemeral("サーバー内で実行してください。"));
+  // 表示制限はサーバー側で変更できるため、実行時にも管理者権限を確認する
+  if (!hasAdministrator(interaction)) {
+    return interactionResponse(ephemeral("このコマンドは管理者権限を持つメンバーだけが使えます。"));
+  }
+
+  const options = new Map<string, any>(
+    ((interaction.data?.options as any[] | undefined) ?? []).map(option => [String(option.name), option.value])
+  );
+  const buyerId = String(options.get("購入者") ?? "");
+  const productTitle = String(options.get("商品") ?? "").trim();
+  const priceJpy = Number(options.get("価格") ?? 0);
+  const review = String(options.get("感想") ?? "").trim();
+  const attachment = interaction.data?.resolved?.attachments?.[String(options.get("画像") ?? "")];
+
+  if (!/^\d{15,22}$/.test(buyerId) || !productTitle || !review || !Number.isFinite(priceJpy) || priceJpy <= 0) {
+    return interactionResponse(ephemeral("入力内容が不正です。"));
+  }
+  if (!attachment?.url) return interactionResponse(ephemeral("画像を1枚添付してください。"));
+  const contentType = String(attachment.content_type ?? "").split(";")[0]!.trim().toLowerCase();
+  const extension = REVIEW_IMAGE_TYPES[contentType];
+  if (!extension) return interactionResponse(ephemeral("画像は PNG / JPEG / GIF / WebP で添付してください。"));
+  if (Number(attachment.size ?? 0) > REVIEW_MAX_IMAGE_BYTES) {
+    return interactionResponse(ephemeral("画像は10MB以下にしてください。"));
+  }
+
+  await ensureSchema(env);
+  const cfg = await getAvConfig(env, guildId);
+  if (!cfg.review_channel_id) {
+    return interactionResponse(ephemeral("実績投稿チャンネルが設定されていません。管理サイトのAmazon自販機タブで設定してください。"));
+  }
+  const reviewChannelId = cfg.review_channel_id;
+  const appId = env.DISCORD_APPLICATION_ID;
+  const token = String(interaction.token ?? "");
+
+  ctx.waitUntil((async () => {
+    try {
+      await postReviewMessage(env, reviewChannelId, {
+        buyerId,
+        priceJpy: Math.round(priceJpy),
+        productTitle,
+        review,
+        imageUrl: String(attachment.url),
+        contentType,
+        extension,
+      });
+      await patchInteraction(appId, token, { content: `✅ 実績を投稿しました：<#${reviewChannelId}>` });
+    } catch (err) {
+      console.error("av manual review post failed", err);
+      await patchInteraction(appId, token, {
+        content: "実績の投稿に失敗しました。時間をおいてもう一度お試しください。",
+      }).catch(() => {});
+    }
+  })());
+
+  return deferEphemeral();
+}
+
 // Discord のモーダル送信は Label (type 18) か Action Row (type 1) の中に入力部品が入る
 function findModalComponent(interaction: any, customId: string): any | null {
   const stack: any[] = [...((interaction.data?.components as any[] | undefined) ?? [])];
@@ -376,40 +513,16 @@ export async function handleAvReviewModal(interaction: any, env: Env, ctx: Execu
 
   ctx.waitUntil((async () => {
     try {
-      // Discord の添付URLは期限付きなので、画像を取得して実績チャンネルへ添付し直す
-      const imageRes = await fetch(String(attachment.url));
-      if (!imageRes.ok) throw new Error(`image download ${imageRes.status}`);
-      const image = await imageRes.arrayBuffer();
-      if (image.byteLength > REVIEW_MAX_IMAGE_BYTES) throw new Error("image too large");
-      const filename = `amazon-review.${extension}`;
-
-      const form = new FormData();
-      form.set("payload_json", JSON.stringify({
-        embeds: [{
-          title: "📦 実績",
-          color: 0xff9900,
-          description: review.slice(0, 1000),
-          fields: [
-            { name: "購入者", value: `<@${order.user_id}>`, inline: true },
-            { name: "Amazon価格", value: `¥${Number(order.price_jpy).toLocaleString("ja-JP")}`, inline: true },
-            { name: "商品", value: order.product_title.slice(0, 1024), inline: false },
-          ],
-          image: { url: `attachment://${filename}` },
-          timestamp: new Date().toISOString(),
-        }],
-        attachments: [{ id: 0, filename }],
-        allowed_mentions: { parse: [] },
-      }));
-      form.set("files[0]", new File([image], filename, { type: contentType }));
-      // botFetch はボディがあると Content-Type を application/json に固定するので、multipart は直接送る
-      const postRes = await fetch(`https://discord.com/api/v10/channels/${reviewChannelId}/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN.trim()}` },
-        body: form,
+      const postedId = await postReviewMessage(env, reviewChannelId, {
+        buyerId: order.user_id,
+        priceJpy: Number(order.price_jpy),
+        productTitle: order.product_title,
+        review,
+        imageUrl: String(attachment.url),
+        contentType,
+        extension,
       });
-      if (!postRes.ok) throw new Error(`review post ${postRes.status}: ${(await postRes.text().catch(() => "")).slice(0, 200)}`);
-      const posted = await postRes.json() as { id: string };
-      await completeAvOrderReview(env, orderId, posted.id);
+      await completeAvOrderReview(env, orderId, postedId);
 
       if (panelMessageId && panelChannelId) {
         await botJson(env, `/channels/${panelChannelId}/messages/${panelMessageId}`, {

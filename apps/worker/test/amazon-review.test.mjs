@@ -209,3 +209,74 @@ test('review is rejected for non-image files and when no achievement channel is 
   assert.equal(noChannel.body.type, 4);
   assert.match(noChannel.body.data.content, /実績投稿チャンネルが設定されていません/);
 });
+
+function payloadOf(call) {
+  const match = call.body.match(/name="payload_json"\r\n(?:Content-Type:[^\r]*\r\n)?\r\n([\s\S]*?)\r\n--/);
+  assert.ok(match, 'multipart payload_json');
+  const payload = JSON.parse(match[1]);
+  for (const embed of payload.embeds) delete embed.timestamp;
+  return payload;
+}
+
+function reviewCommand(permissions, overrides = {}) {
+  return {
+    type: 2,
+    channel_id: ticketChannelId,
+    member: { user: { id: otherId }, permissions },
+    data: {
+      name: '実績',
+      options: [
+        { name: '購入者', type: 6, value: buyerId },
+        { name: '商品', type: 3, value: 'テスト商品' },
+        { name: '価格', type: 4, value: 3000 },
+        { name: '感想', type: 3, value: '受け取りまでスムーズでした！' },
+        { name: '画像', type: 11, value: attachmentId }
+      ],
+      resolved: { attachments: { [attachmentId]: {
+        id: attachmentId, filename: 'photo.png', size: imageBytes.length, content_type: 'image/png',
+        url: 'https://cdn.discordapp.com/ephemeral-attachments/1/2/photo.png'
+      } } },
+      ...overrides
+    }
+  };
+}
+
+test('/実績: only administrators can post manually, with exactly the same look as the panel', async t => {
+  const env = await runtime(t);
+  await configure(env);
+  const reviewPosts = () => env.calls.filter(c => c.method === 'POST' && c.path === `/api/v10/channels/${reviewChannelId}/messages`);
+
+  // 管理者権限なし (メッセージ管理など他の権限だけ) は拒否
+  const denied = await env.interaction(reviewCommand(String(8192n | 2048n)));
+  assert.equal(denied.body.type, 4);
+  assert.match(denied.body.data.content, /管理者権限/);
+  assert.equal(reviewPosts().length, 0);
+
+  // 管理者は投稿できる
+  const ok = await env.interaction(reviewCommand(String(8n | 2048n)));
+  assert.equal(ok.body.type, 5);
+  await waitFor(() => reviewPosts().length === 1 && env.calls.some(c => c.path.startsWith('/api/v10/webhooks/')), 'manual post');
+  assert.match(env.calls.filter(c => c.path.startsWith('/api/v10/webhooks/')).pop().body, /実績を投稿しました/);
+  const manual = payloadOf(reviewPosts()[0]);
+
+  // 同じ内容をパネルから投稿したものと完全に一致する
+  const orderId = await purchase(env);
+  await env.interaction(reviewSubmit(orderId));
+  await waitFor(() => reviewPosts().length === 2, 'panel post');
+  assert.deepEqual(manual, payloadOf(reviewPosts()[1]));
+  assert.equal(manual.embeds[0].title, '📦 実績');
+});
+
+test('/実績 is registered as an administrator-only command', async t => {
+  const env = await runtime(t);
+  // Cron のコマンド同期で Discord に登録される定義を確認する
+  const worker = await env.mf.getWorker();
+  await worker.scheduled({ cron: '* * * * *' });
+  await waitFor(() => env.calls.some(c => c.method === 'PUT' && c.path === `/api/v10/applications/${botId}/commands`), 'command sync');
+  const commands = JSON.parse(env.calls.find(c => c.method === 'PUT' && c.path.endsWith('/commands')).body);
+  const command = commands.find(c => c.name === '実績');
+  assert.ok(command, '/実績 is registered');
+  assert.equal(command.default_member_permissions, '8');
+  assert.equal(command.dm_permission, false);
+  assert.deepEqual(command.options.map(o => o.name), ['購入者', '商品', '価格', '感想', '画像']);
+});

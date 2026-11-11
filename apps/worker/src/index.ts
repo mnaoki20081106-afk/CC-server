@@ -93,7 +93,7 @@ export { DiscordGateway } from "./discord-gateway";
 export { DiscordSecurityGateway } from "./security-integration";
 import { securityScheduled, withIntegratedSecurity } from "./security-integration";
 // Amazon自販機 (CC-server)
-import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal, handleAvReviewButton, handleAvReviewModal } from "./amazon-vending";
+import { handleAvBuyButton, handleAvUrlModal, handleAvSelect, handleAvNext, handleAvAddrModal, handleAvReviewButton, handleAvReviewModal, AV_REVIEW_COMMAND, isAvReviewCommand, handleAvReviewCommand } from "./amazon-vending";
 import {
   openSecurityMaintenanceLease,
   securityBridgeConfigured,
@@ -1544,6 +1544,11 @@ async function processInteraction(
       return handleAvAddrModal(interaction, env, ctx);
     }
 
+    // Amazon自販機 手動実績投稿コマンド: /実績 (管理者のみ)
+    if (isAvReviewCommand(interaction)) {
+      return handleAvReviewCommand(interaction, env, ctx);
+    }
+
     // Amazon自販機 実績投稿ボタン: av:review:<orderId>
     if (type === 3 && customId.startsWith("av:review:")) {
       return handleAvReviewButton(interaction, env);
@@ -1693,7 +1698,8 @@ function commandDefinitions(){
   return [
     {name:"dashboard",description:"管理ダッシュボードを開きます",type:1},
     {name:"security-status",description:"セキュリティ設定を表示します",type:1},
-    ...MEDIATION_COMMANDS
+    ...MEDIATION_COMMANDS,
+    AV_REVIEW_COMMAND
   ];
 }
 
